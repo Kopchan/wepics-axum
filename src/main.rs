@@ -1,23 +1,22 @@
 use tokio::net::TcpListener;
 
+use wepics_axum::routes;
+use wepics_axum::state::AppState;
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let app = axum::Router::new()
-        .route("/", axum::routing::get(hello))
-        .route("/hello/{name}", axum::routing::get(hello_name));
+    let database_url =
+        std::env::var("DATABASE_URL").unwrap_or_else(|_| "sqlite://data/wepics.db".to_string());
+    let media_dir = std::env::var("MEDIA_DIR").unwrap_or_else(|_| "data/media".to_string());
 
-    let addr = "127.0.0.1:3000";
-    let listener = TcpListener::bind(addr).await?;
+    let state = AppState::connect(&database_url, media_dir).await?;
+    let app = routes::app(state);
+
+    let addr = std::env::var("ADDR").unwrap_or_else(|_| "127.0.0.1:3000".to_string());
+    let listener = TcpListener::bind(&addr).await?;
     println!("Listening on http://{addr}");
+    println!("Database: {database_url}");
 
     axum::serve(listener, app).await?;
     Ok(())
-}
-
-async fn hello() -> &'static str {
-    "Hello, World!"
-}
-
-async fn hello_name(axum::extract::Path(name): axum::extract::Path<String>) -> String {
-    format!("Hello, {name}!")
 }
