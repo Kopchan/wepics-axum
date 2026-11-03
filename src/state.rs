@@ -1,23 +1,29 @@
+use std::collections::HashSet;
+use std::path::PathBuf;
 use std::str::FromStr;
+use std::sync::{Arc, Mutex};
 
 use sqlx::SqlitePool;
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
 
-use crate::models::ROOT_ALBUM_HASH;
+use crate::models::{Album, Media, ROOT_ALBUM_HASH};
 
 /// Shared application state, cloned into every handler by axum.
 #[derive(Clone)]
 pub struct AppState {
     pub db: SqlitePool,
     /// Storage root, `./data/media` by default.
-    pub media_dir: std::path::PathBuf,
+    pub media_dir: PathBuf,
+    /// Albums with a background indexing task in flight.
+    syncing: SyncTracker,
 }
 
 impl AppState {
-    pub fn new(db: SqlitePool, media_dir: impl Into<std::path::PathBuf>) -> Self {
+    pub fn new(db: SqlitePool, media_dir: impl Into<PathBuf>) -> Self {
         Self {
             db,
             media_dir: media_dir.into(),
+            syncing: SyncTracker::default(),
         }
     }
 
@@ -25,7 +31,7 @@ impl AppState {
     /// and bootstraps the storage (root album + media directory).
     pub async fn connect(
         database_url: &str,
-        media_dir: impl Into<std::path::PathBuf>,
+        media_dir: impl Into<PathBuf>,
     ) -> Result<Self, Box<dyn std::error::Error>> {
         let options = SqliteConnectOptions::from_str(database_url)?
             .create_if_missing(true)
@@ -66,35 +72,111 @@ impl AppState {
         Ok(())
     }
 
-    /// Path of a stored file: `<media>/<mediaHash><ext>` for the root album,
-    /// `<media>/<albumHash>/<mediaHash><ext>` otherwise.
+    /// Directory that holds an album's files, relative to the storage root.
     ///
-    /// Returns `None` if either hash cannot safely be used as a path segment.
-    pub fn media_path(
-        &self,
-        album: &crate::models::Album,
-        media: &crate::models::Media,
-    ) -> Option<std::path::PathBuf> {
-        if !is_safe_segment(&album.hash) || !is_safe_segment(&media.hash) {
-            return None;
+    /// The root album has an empty [`Album::path`]; every other album maps to a
+    /// subdirectory. Returns `None` if any path segment is unsafe.
+    pub fn album_dir(&self, album: &Album) -> Option<PathBuf> {
+        let mut dir = self.media_dir.clone();
+
+        for segment in album.path.split('/').filter(|segment| !segment.is_empty()) {
+            if !is_safe_segment(segment) {
+                return None;
+            }
+            dir.push(segment);
         }
 
-        let dir = if album.hash == ROOT_ALBUM_HASH {
-            self.media_dir.clone()
-        } else {
-            self.media_dir.join(&album.hash)
-        };
+        Some(dir)
+    }
 
-        let ext = std::path::Path::new(&media.name)
-            .extension()
-            .and_then(|ext| ext.to_str())
-            .map(|ext| format!(".{ext}"))
-            .unwrap_or_default();
+    /// Path of a stored file: `<media>/<name>` for the root album,
+    /// `<media>/<albumPath>/<name>` otherwise.
+    ///
+    /// Returns `None` if any path segment is unsafe.
+    pub fn media_path(&self, album: &Album, media: &Media) -> Option<PathBuf> {
+        if !is_safe_segment(&media.name) {
+            return None;
+        }
+        let dir = self.album_dir(album)?;
 
-        Some(dir.join(format!("{}{ext}", media.hash)))
+        Some(dir.join(&media.name))
+    }
+
+    /// Marks `album_id` as syncing. `None` means another task already owns it.
+    pub(crate) fn try_claim_sync(&self, album_id: i64) -> Option<SyncGuard> {
+        self.syncing.try_claim(album_id)
     }
 }
 
-fn is_safe_segment(segment: &str) -> bool {
+pub(crate) fn is_safe_segment(segment: &str) -> bool {
     !segment.is_empty() && segment != "." && segment != ".." && !segment.contains(['/', '\\', '\0'])
+}
+
+/// In-memory set of albums with an indexing task in flight.
+///
+/// Uniqueness is per process: one task per album, and the entry is removed when
+/// the task finishes or unwinds.
+#[derive(Clone, Default)]
+pub(crate) struct SyncTracker {
+    running: Arc<Mutex<HashSet<i64>>>,
+}
+
+impl SyncTracker {
+    pub(crate) fn try_claim(&self, album_id: i64) -> Option<SyncGuard> {
+        let mut running = self
+            .running
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+        if !running.insert(album_id) {
+            return None;
+        }
+
+        Some(SyncGuard {
+            album_id,
+            running: Arc::clone(&self.running),
+        })
+    }
+}
+
+/// Releases an album's sync slot on drop, including on panic.
+pub(crate) struct SyncGuard {
+    album_id: i64,
+    running: Arc<Mutex<HashSet<i64>>>,
+}
+
+impl Drop for SyncGuard {
+    fn drop(&mut self) {
+        let mut running = self
+            .running
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        running.remove(&self.album_id);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::SyncTracker;
+
+    #[test]
+    fn sync_claim_is_unique_per_album() {
+        let tracker = SyncTracker::default();
+
+        let guard = tracker.try_claim(7).expect("first claim wins");
+        assert!(
+            tracker.try_claim(7).is_none(),
+            "second claim must be refused"
+        );
+        assert!(
+            tracker.try_claim(8).is_some(),
+            "other albums are independent"
+        );
+
+        drop(guard);
+        assert!(
+            tracker.try_claim(7).is_some(),
+            "slot is released when the task ends"
+        );
+    }
 }

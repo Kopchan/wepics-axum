@@ -5,12 +5,13 @@ use sqlx::{QueryBuilder, Sqlite};
 
 use super::pagination::Pagination;
 use crate::error::AppError;
+use crate::indexer::{self, SyncStart};
 use crate::models::Album;
 use crate::state::AppState;
 
-const ALBUM_SELECT: &str = "SELECT id, name, hash, parent_id, indexed_at, sort_name, \
+const ALBUM_SELECT: &str = "SELECT id, name, hash, parent_id, path, indexed_at, sort_name, \
      created_at, updated_at FROM albums WHERE hash = ?1";
-const CHILDREN_SELECT: &str = "SELECT id, name, hash, parent_id, indexed_at, sort_name, \
+const CHILDREN_SELECT: &str = "SELECT id, name, hash, parent_id, path, indexed_at, sort_name, \
      created_at, updated_at FROM albums";
 
 /// `GET /api/albums/{hash}/child?page=1&limit=30&sort=name`
@@ -29,6 +30,16 @@ pub struct AlbumPage {
     pub limit: u32,
     pub total: i64,
     pub pages: i64,
+}
+
+/// Response of `GET /api/album/{hash}`.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct AlbumInfo {
+    pub album: Album,
+    /// `"started"` when this request spawned a task, `"running"` when one was
+    /// already in flight; absent when the index is fresh.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub sync: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -110,11 +121,21 @@ pub async fn list_children(
 }
 
 /// `GET /api/album/{hash}` — `hash` may be the literal `root`.
+///
+/// Starts a background filesystem sync when the album was never indexed or its
+/// index is older than an hour. The response is wrapped in an `album` key.
 pub async fn get_album(
     State(state): State<AppState>,
     Path(hash): Path<String>,
-) -> Result<Json<Album>, AppError> {
-    Ok(Json(resolve_album(&state, &hash).await?))
+) -> Result<Json<AlbumInfo>, AppError> {
+    let album = resolve_album(&state, &hash).await?;
+    let sync = match indexer::start_if_stale(&state, &album) {
+        SyncStart::Fresh => None,
+        SyncStart::Started => Some("started".to_string()),
+        SyncStart::Running => Some("running".to_string()),
+    };
+
+    Ok(Json(AlbumInfo { album, sync }))
 }
 
 /// Looks an album up by hash. The root album is created at startup by

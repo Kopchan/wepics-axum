@@ -13,6 +13,12 @@ pub struct Album {
     pub hash: String,
     /// `None` for root albums.
     pub parent_id: Option<i64>,
+    /// Directory relative to the media root, `/`-separated; empty for root.
+    ///
+    /// This is the folder an album was discovered in, so it stays stable when
+    /// the album is renamed or its URL hash changes. Internal.
+    #[serde(skip_serializing, default)]
+    pub path: String,
     /// Natural-sort key derived from `name`; internal, never sent to clients.
     ///
     /// Writers must call [`crate::models::natural_sort_key`] and store the

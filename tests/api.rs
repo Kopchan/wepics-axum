@@ -9,8 +9,8 @@ use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
 use tempfile::TempDir;
 use tower::ServiceExt;
 
-use wepics_axum::controllers::{AlbumPage, MediaPage};
-use wepics_axum::models::{Album, Media, ROOT_ALBUM_HASH, natural_sort_key};
+use wepics_axum::controllers::{AlbumInfo, AlbumPage, MediaPage};
+use wepics_axum::models::{Album, Media, MediaType, ROOT_ALBUM_HASH, natural_sort_key};
 use wepics_axum::routes;
 use wepics_axum::state::AppState;
 
@@ -32,9 +32,20 @@ async fn setup_raw() -> (TempDir, AppState) {
 }
 
 /// Mirrors what `AppState::connect` does at startup.
+///
+/// The root album is marked freshly indexed so unrelated tests do not kick off
+/// background syncs; sync-specific tests reset `indexed_at` explicitly.
 async fn setup() -> (TempDir, AppState) {
     let (dir, state) = setup_raw().await;
     state.initialize().await.unwrap();
+
+    sqlx::query("UPDATE albums SET indexed_at = ?1 WHERE hash = ?2")
+        .bind(Utc::now())
+        .bind(ROOT_ALBUM_HASH)
+        .execute(&state.db)
+        .await
+        .unwrap();
+
     (dir, state)
 }
 
@@ -83,12 +94,14 @@ async fn send_with(
 
 async fn insert_album(pool: &SqlitePool, name: &str, hash: &str) -> Album {
     sqlx::query_as(
-        "INSERT INTO albums (name, hash, sort_name) VALUES (?1, ?2, ?3)
-         RETURNING id, name, hash, parent_id, indexed_at, sort_name, created_at, updated_at",
+        "INSERT INTO albums (name, hash, sort_name, path, indexed_at)
+         VALUES (?1, ?2, ?3, ?2, ?4)
+         RETURNING id, name, hash, parent_id, path, indexed_at, sort_name, created_at, updated_at",
     )
     .bind(name)
     .bind(hash)
     .bind(natural_sort_key(name))
+    .bind(Utc::now())
     .fetch_one(pool)
     .await
     .unwrap()
@@ -101,15 +114,17 @@ async fn insert_child(
     created_at: DateTime<Utc>,
 ) -> Album {
     sqlx::query_as(
-        "INSERT INTO albums (name, hash, sort_name, parent_id, created_at)
-         VALUES (?1, ?2, ?3, ?4, ?5)
-         RETURNING id, name, hash, parent_id, indexed_at, sort_name, created_at, updated_at",
+        "INSERT INTO albums (name, hash, sort_name, parent_id, path, created_at, indexed_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+         RETURNING id, name, hash, parent_id, path, indexed_at, sort_name, created_at, updated_at",
     )
     .bind(name)
     .bind(format!("{parent_id}-{name}"))
     .bind(natural_sort_key(name))
     .bind(parent_id)
+    .bind(format!("test/{parent_id}/{name}"))
     .bind(created_at)
+    .bind(Utc::now())
     .fetch_one(pool)
     .await
     .unwrap()
@@ -162,8 +177,56 @@ fn parse_album_page(body: &[u8]) -> AlbumPage {
     })
 }
 
+fn parse_album_info(body: &[u8]) -> AlbumInfo {
+    serde_json::from_slice(body).unwrap_or_else(|err| {
+        panic!(
+            "invalid AlbumInfo json ({err}): {}",
+            String::from_utf8_lossy(body)
+        )
+    })
+}
+
 fn album_names(page: &AlbumPage) -> Vec<&str> {
     page.items.iter().map(|album| album.name.as_str()).collect()
+}
+
+async fn root_album_id(state: &AppState) -> i64 {
+    sqlx::query_scalar("SELECT id FROM albums WHERE hash = ?1")
+        .bind(ROOT_ALBUM_HASH)
+        .fetch_one(&state.db)
+        .await
+        .unwrap()
+}
+
+async fn set_indexed_at(state: &AppState, album_id: i64, value: Option<DateTime<Utc>>) {
+    sqlx::query("UPDATE albums SET indexed_at = ?1 WHERE id = ?2")
+        .bind(value)
+        .bind(album_id)
+        .execute(&state.db)
+        .await
+        .unwrap();
+}
+
+/// Waits until a background sync has written `indexed_at` after `after`.
+async fn wait_for_indexed(state: &AppState, album_id: i64, after: DateTime<Utc>) {
+    for _ in 0..300 {
+        let indexed: Option<DateTime<Utc>> =
+            sqlx::query_scalar("SELECT indexed_at FROM albums WHERE id = ?1")
+                .bind(album_id)
+                .fetch_one(&state.db)
+                .await
+                .unwrap();
+
+        if let Some(indexed) = indexed
+            && indexed > after
+        {
+            return;
+        }
+
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+
+    panic!("album {album_id} was not indexed after {after}");
 }
 
 #[tokio::test]
@@ -178,14 +241,15 @@ async fn root_album_is_created_at_startup() {
     let (status, _, body) = send(&app, "/api/album/root").await;
     assert_eq!(status, StatusCode::OK);
 
-    let album: Album = serde_json::from_slice(&body).unwrap();
-    assert_eq!(album.hash, ROOT_ALBUM_HASH);
-    assert_eq!(album.name, "root");
+    let info = parse_album_info(&body);
+    assert_eq!(info.album.hash, ROOT_ALBUM_HASH);
+    assert_eq!(info.album.name, "root");
+    let album = info.album;
 
     // Second request reuses the row instead of creating a duplicate.
     let (status, _, body) = send(&app, "/api/album/root").await;
     assert_eq!(status, StatusCode::OK);
-    let again: Album = serde_json::from_slice(&body).unwrap();
+    let again = parse_album_info(&body).album;
     assert_eq!(again.id, album.id);
 
     let roots: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM albums WHERE hash = ?1")
@@ -229,10 +293,11 @@ async fn album_by_hash_and_unknown_hash() {
 
     let (status, _, body) = send(&app, "/api/album/abc123").await;
     assert_eq!(status, StatusCode::OK);
-    let fetched: Album = serde_json::from_slice(&body).unwrap();
+    let fetched = parse_album_info(&body).album;
 
-    // `sort_name` is internal: clients never see it, so it deserializes empty.
+    // `sort_name` and `path` are internal: clients never see them.
     assert_eq!(fetched.sort_name, "");
+    assert_eq!(fetched.path, "");
     assert_eq!(fetched.id, album.id);
     assert_eq!(fetched.name, album.name);
     assert_eq!(fetched.hash, album.hash);
@@ -395,7 +460,7 @@ async fn files_are_served_from_the_media_dir() {
 
     let album_dir = dir.path().join("media").join(&album.hash);
     std::fs::create_dir_all(&album_dir).unwrap();
-    std::fs::write(album_dir.join(format!("{}.jpg", media.hash)), b"jpegdata").unwrap();
+    std::fs::write(album_dir.join(&media.name), b"jpegdata").unwrap();
 
     let app = app(state);
 
@@ -419,7 +484,7 @@ async fn root_album_files_live_directly_in_media_dir() {
 
     let (status, _, body) = send(&app, "/api/album/root").await;
     assert_eq!(status, StatusCode::OK);
-    let root: Album = serde_json::from_slice(&body).unwrap();
+    let root = parse_album_info(&body).album;
 
     let media = insert_media(
         &state.db,
@@ -432,11 +497,7 @@ async fn root_album_files_live_directly_in_media_dir() {
         },
     )
     .await;
-    std::fs::write(
-        dir.path().join("media").join(format!("{}.png", media.hash)),
-        b"png",
-    )
-    .unwrap();
+    std::fs::write(dir.path().join("media").join(&media.name), b"png").unwrap();
 
     let (status, _, body) = send(&app, "/files/root/h2").await;
     assert_eq!(status, StatusCode::OK);
@@ -554,7 +615,7 @@ async fn files_support_range_requests_and_long_lived_caching() {
 
     let album_dir = dir.path().join("media").join(&album.hash);
     std::fs::create_dir_all(&album_dir).unwrap();
-    std::fs::write(album_dir.join(format!("{}.jpg", media.hash)), b"jpegdata").unwrap();
+    std::fs::write(album_dir.join(&media.name), b"jpegdata").unwrap();
 
     let app = app(state);
 
@@ -646,6 +707,219 @@ async fn cors_is_enabled_for_every_route() {
     );
     assert_eq!(headers[header::ACCESS_CONTROL_MAX_AGE], "86400");
     assert!(body.is_empty());
+
+    drop(dir);
+}
+
+#[tokio::test]
+async fn album_info_is_wrapped_and_syncs_only_when_stale() {
+    let (dir, state) = setup().await;
+    let root_id = root_album_id(&state).await;
+    let app = app(state.clone());
+
+    // Fresh album: wrapped in `album`, no sync notice.
+    let (status, _, body) = send(&app, "/api/album/root").await;
+    assert_eq!(status, StatusCode::OK);
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert!(json.get("hash").is_none(), "album must be wrapped");
+    assert!(json.get("sync").is_none(), "fresh album must not sync");
+    assert_eq!(json["album"]["hash"], ROOT_ALBUM_HASH);
+
+    // 30 minutes old is still fresh.
+    set_indexed_at(
+        &state,
+        root_id,
+        Some(Utc::now() - chrono::Duration::minutes(30)),
+    )
+    .await;
+    let (_, _, body) = send(&app, "/api/album/root").await;
+    assert!(parse_album_info(&body).sync.is_none());
+
+    // Older than an hour starts exactly one background task.
+    let stale = Utc::now() - chrono::Duration::minutes(61);
+    set_indexed_at(&state, root_id, Some(stale)).await;
+    let (_, _, body) = send(&app, "/api/album/root").await;
+    assert_eq!(parse_album_info(&body).sync.as_deref(), Some("started"));
+
+    wait_for_indexed(&state, root_id, stale).await;
+
+    // Once done the index is fresh again: no second task.
+    let (_, _, body) = send(&app, "/api/album/root").await;
+    assert!(parse_album_info(&body).sync.is_none());
+
+    drop(dir);
+}
+
+#[tokio::test]
+async fn sync_indexes_files_and_discovers_child_albums() {
+    let (dir, state) = setup().await;
+    let root_id = root_album_id(&state).await;
+    let media_dir = state.media_dir.clone();
+
+    std::fs::write(media_dir.join("photo10.jpg"), b"0123456789").unwrap();
+    std::fs::write(media_dir.join("photo2.png"), b"png").unwrap();
+    std::fs::write(media_dir.join("dup.jpg"), b"dup-jpg").unwrap();
+    std::fs::write(media_dir.join("dup.png"), b"dup-png").unwrap();
+    std::fs::write(media_dir.join("clip.mp4"), b"mp4").unwrap();
+    std::fs::write(media_dir.join("song.mp3"), b"mp3").unwrap();
+    std::fs::write(media_dir.join("notes.txt"), b"ignored").unwrap();
+    std::fs::write(media_dir.join(".hidden.jpg"), b"hidden").unwrap();
+
+    std::fs::create_dir(media_dir.join("Winter")).unwrap();
+    std::fs::write(media_dir.join("Winter").join("snow.jpg"), b"snow").unwrap();
+
+    set_indexed_at(&state, root_id, None).await;
+    let app = app(state.clone());
+    let since = Utc::now() - chrono::Duration::seconds(1);
+
+    let (_, _, body) = send(&app, "/api/album/root").await;
+    assert_eq!(parse_album_info(&body).sync.as_deref(), Some("started"));
+    wait_for_indexed(&state, root_id, since).await;
+
+    let rows: Vec<Media> = sqlx::query_as(
+        "SELECT id, name, hash, \"type\", album_id, width, height, duration_sec, date, size,
+                sort_name, created_at, updated_at
+         FROM media WHERE album_id = ?1 ORDER BY name",
+    )
+    .bind(root_id)
+    .fetch_all(&state.db)
+    .await
+    .unwrap();
+
+    let names: Vec<&str> = rows.iter().map(|media| media.name.as_str()).collect();
+    assert_eq!(
+        names,
+        vec![
+            "clip.mp4",
+            "dup.jpg",
+            "dup.png",
+            "photo10.jpg",
+            "photo2.png",
+            "song.mp3"
+        ]
+    );
+    assert!(
+        !names.contains(&"snow.jpg"),
+        "subfolders are albums, not media"
+    );
+
+    let photo = rows
+        .iter()
+        .find(|media| media.name == "photo10.jpg")
+        .unwrap();
+    assert_eq!(photo.hash.len(), 24, "media hash is generated by SQLite");
+    assert_eq!(photo.r#type, MediaType::Image);
+    assert_eq!(photo.size, 10);
+    assert_eq!(photo.sort_name, "photo0000000010.jpg");
+    assert!(photo.date.is_some());
+    assert_eq!(photo.width, 0);
+    assert_eq!(photo.height, 0);
+    assert_eq!(photo.duration_sec, None);
+
+    assert_eq!(
+        rows.iter()
+            .find(|media| media.name == "clip.mp4")
+            .unwrap()
+            .r#type,
+        MediaType::Video
+    );
+    assert_eq!(
+        rows.iter()
+            .find(|media| media.name == "song.mp3")
+            .unwrap()
+            .r#type,
+        MediaType::Audio
+    );
+    assert_eq!(
+        rows.iter()
+            .find(|media| media.name == "photo2.png")
+            .unwrap()
+            .r#type,
+        MediaType::Image
+    );
+
+    // The subdirectory became a child album with its own (not yet indexed) row.
+    let winter: Album = sqlx::query_as(
+        "SELECT id, name, hash, parent_id, path, indexed_at, sort_name, created_at, updated_at
+         FROM albums WHERE path = 'Winter'",
+    )
+    .fetch_one(&state.db)
+    .await
+    .unwrap();
+    assert_eq!(winter.name, "Winter");
+    assert_eq!(winter.parent_id, Some(root_id));
+    assert_eq!(winter.path, "Winter");
+    assert_eq!(winter.indexed_at, None);
+    assert_eq!(winter.hash.len(), 24, "hash is generated by SQLite");
+
+    let (_, _, body) = send(&app, "/api/albums/root/child").await;
+    assert_eq!(album_names(&parse_album_page(&body)), vec!["Winter"]);
+
+    // Requesting the child indexes its own folder on demand.
+    let winter_since = Utc::now() - chrono::Duration::seconds(1);
+    let (_, _, body) = send(&app, &format!("/api/album/{}", winter.hash)).await;
+    assert_eq!(parse_album_info(&body).sync.as_deref(), Some("started"));
+    wait_for_indexed(&state, winter.id, winter_since).await;
+
+    let child_media: Vec<Media> = sqlx::query_as(
+        "SELECT id, name, hash, \"type\", album_id, width, height, duration_sec, date, size,
+                sort_name, created_at, updated_at
+         FROM media WHERE album_id = ?1",
+    )
+    .bind(winter.id)
+    .fetch_all(&state.db)
+    .await
+    .unwrap();
+    assert_eq!(child_media.len(), 1);
+    assert_eq!(child_media[0].name, "snow.jpg");
+    assert_eq!(child_media[0].hash.len(), 24);
+
+    let (status, _, body) = send(
+        &app,
+        &format!("/files/{}/{}", winter.hash, child_media[0].hash),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body, b"snow");
+
+    let (status, _, body) = send(&app, &format!("/files/root/{}", photo.hash)).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body, b"0123456789");
+
+    drop(dir);
+}
+
+#[tokio::test]
+async fn resync_removes_media_that_disappeared() {
+    let (dir, state) = setup().await;
+    let root_id = root_album_id(&state).await;
+    let media_dir = state.media_dir.clone();
+
+    std::fs::write(media_dir.join("keep.jpg"), b"keep").unwrap();
+    std::fs::write(media_dir.join("drop.jpg"), b"drop").unwrap();
+
+    set_indexed_at(&state, root_id, None).await;
+    let app = app(state.clone());
+    let since = Utc::now() - chrono::Duration::seconds(1);
+    let _ = send(&app, "/api/album/root").await;
+    wait_for_indexed(&state, root_id, since).await;
+
+    std::fs::remove_file(media_dir.join("drop.jpg")).unwrap();
+    std::fs::write(media_dir.join("new.png"), b"new").unwrap();
+
+    let stale = Utc::now() - chrono::Duration::hours(2);
+    set_indexed_at(&state, root_id, Some(stale)).await;
+    let (_, _, body) = send(&app, "/api/album/root").await;
+    assert_eq!(parse_album_info(&body).sync.as_deref(), Some("started"));
+    wait_for_indexed(&state, root_id, stale).await;
+
+    let names: Vec<String> =
+        sqlx::query_scalar("SELECT name FROM media WHERE album_id = ?1 ORDER BY name")
+            .bind(root_id)
+            .fetch_all(&state.db)
+            .await
+            .unwrap();
+    assert_eq!(names, vec!["keep.jpg", "new.png"]);
 
     drop(dir);
 }

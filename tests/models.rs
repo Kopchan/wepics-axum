@@ -22,8 +22,8 @@ async fn test_pool() -> SqlitePool {
 
 async fn insert_album(pool: &SqlitePool, name: &str, hash: &str, parent_id: Option<i64>) -> Album {
     sqlx::query_as(
-        "INSERT INTO albums (name, hash, sort_name, parent_id) VALUES (?1, ?2, ?3, ?4)
-         RETURNING id, name, hash, parent_id, indexed_at, sort_name, created_at, updated_at",
+        "INSERT INTO albums (name, hash, sort_name, parent_id, path) VALUES (?1, ?2, ?3, ?4, ?2)
+         RETURNING id, name, hash, parent_id, path, indexed_at, sort_name, created_at, updated_at",
     )
     .bind(name)
     .bind(hash)
@@ -70,6 +70,7 @@ async fn album_and_media_roundtrip() {
     let root = insert_album(&pool, "Photos", "root-hash", None).await;
     assert_eq!(root.parent_id, None);
     assert_eq!(root.indexed_at, None);
+    assert_eq!(root.path, "root-hash");
     assert_eq!(root.sort_name, "photos");
 
     let child = insert_album(&pool, "2026", "child-hash", Some(root.id)).await;
@@ -259,7 +260,7 @@ async fn updated_at_is_refreshed_on_update() {
         .unwrap();
 
     let updated: Album = sqlx::query_as(
-        "SELECT id, name, hash, parent_id, indexed_at, sort_name, created_at, updated_at
+        "SELECT id, name, hash, parent_id, path, indexed_at, sort_name, created_at, updated_at
          FROM albums WHERE id = ?1",
     )
     .bind(album.id)
