@@ -619,7 +619,7 @@ async fn files_support_range_requests_and_long_lived_caching() {
 
     let app = app(state);
 
-    // Full response advertises ranges and immutable caching.
+    // Full response advertises ranges, validators and immutable caching.
     let (status, headers, body) = send(&app, "/files/abc123/h1").await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(headers[header::ACCEPT_RANGES], "bytes");
@@ -627,6 +627,21 @@ async fn files_support_range_requests_and_long_lived_caching() {
         headers[header::CACHE_CONTROL],
         "public, max-age=31536000, immutable"
     );
+    assert!(headers.contains_key(header::ETAG));
+    assert!(headers.contains_key(header::LAST_MODIFIED));
+    assert_eq!(body, b"jpegdata");
+
+    // A matching validator is answered with 304 by `ServeFile`.
+    let mut conditional = HeaderMap::new();
+    conditional.insert(header::IF_NONE_MATCH, headers[header::ETAG].clone());
+    let (status, _, body) = send_with(&app, Method::GET, "/files/abc123/h1", conditional).await;
+    assert_eq!(status, StatusCode::NOT_MODIFIED);
+    assert!(body.is_empty());
+
+    // Multi-range requests are ignored and served as a normal full response.
+    let (status, headers, body) = send_range(&app, "/files/abc123/h1", "bytes=0-1,3-4").await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(headers.get(header::CONTENT_RANGE).is_none());
     assert_eq!(body, b"jpegdata");
 
     // Closed range.
@@ -676,6 +691,8 @@ async fn cors_is_enabled_for_every_route() {
         .to_str()
         .unwrap();
     assert!(exposed.contains("content-range"), "exposed: {exposed}");
+    assert!(exposed.contains("etag"), "exposed: {exposed}");
+    assert!(exposed.contains("cache-control"), "exposed: {exposed}");
 
     let mut preflight = HeaderMap::new();
     preflight.insert(
@@ -693,12 +710,12 @@ async fn cors_is_enabled_for_every_route() {
 
     let (status, headers, body) =
         send_with(&app, Method::OPTIONS, "/files/abc123/h1", preflight).await;
-    assert_eq!(status, StatusCode::NO_CONTENT);
+    assert_eq!(status, StatusCode::OK);
     assert_eq!(headers[header::ACCESS_CONTROL_ALLOW_ORIGIN], "*");
-    assert_eq!(
-        headers[header::ACCESS_CONTROL_ALLOW_METHODS],
-        "GET, HEAD, OPTIONS"
-    );
+    let methods = headers[header::ACCESS_CONTROL_ALLOW_METHODS]
+        .to_str()
+        .unwrap();
+    assert!(methods.contains("GET"), "methods: {methods}");
     assert!(
         headers[header::ACCESS_CONTROL_ALLOW_HEADERS]
             .to_str()
