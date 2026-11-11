@@ -1,4 +1,6 @@
+use std::path::Path;
 use std::str::FromStr;
+use std::time::Duration;
 
 use axum::Router;
 use axum::body::Body;
@@ -7,6 +9,7 @@ use chrono::{DateTime, TimeZone, Utc};
 use sqlx::SqlitePool;
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
 use tempfile::TempDir;
+use tokio_stream::StreamExt;
 use tower::ServiceExt;
 
 use wepics_axum::controllers::{AlbumInfo, AlbumPage, MediaPage};
@@ -229,6 +232,50 @@ async fn wait_for_indexed(state: &AppState, album_id: i64, after: DateTime<Utc>)
     panic!("album {album_id} was not indexed after {after}");
 }
 
+async fn wait_for_media_count(state: &AppState, album_path: &str, expected: i64) {
+    let prefix = format!("{album_path}/%");
+
+    for _ in 0..300 {
+        let count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM media m JOIN albums a ON a.id = m.album_id \
+             WHERE a.path = ?1 OR a.path LIKE ?2",
+        )
+        .bind(album_path)
+        .bind(&prefix)
+        .fetch_one(&state.db)
+        .await
+        .unwrap();
+
+        if count == expected {
+            return;
+        }
+
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+
+    panic!("expected {expected} media under `{album_path}`");
+}
+
+#[cfg(windows)]
+fn create_dir_link(link: &Path, target: &Path) -> bool {
+    std::process::Command::new("cmd")
+        .args([
+            "/C",
+            "mklink",
+            "/J",
+            link.to_str().unwrap(),
+            target.to_str().unwrap(),
+        ])
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(false)
+}
+
+#[cfg(unix)]
+fn create_dir_link(link: &Path, target: &Path) -> bool {
+    std::os::unix::fs::symlink(target, link).is_ok()
+}
+
 #[tokio::test]
 async fn root_album_is_created_at_startup() {
     let (dir, state) = setup().await;
@@ -238,7 +285,7 @@ async fn root_album_is_created_at_startup() {
 
     assert!(media_dir.is_dir(), "media dir must exist after startup");
 
-    let (status, _, body) = send(&app, "/api/album/root").await;
+    let (status, _, body) = send(&app, "/api/albums/root").await;
     assert_eq!(status, StatusCode::OK);
 
     let info = parse_album_info(&body);
@@ -247,7 +294,7 @@ async fn root_album_is_created_at_startup() {
     let album = info.album;
 
     // Second request reuses the row instead of creating a duplicate.
-    let (status, _, body) = send(&app, "/api/album/root").await;
+    let (status, _, body) = send(&app, "/api/albums/root").await;
     assert_eq!(status, StatusCode::OK);
     let again = parse_album_info(&body).album;
     assert_eq!(again.id, album.id);
@@ -267,7 +314,7 @@ async fn requests_never_create_the_root_album() {
     let (dir, state) = setup_raw().await;
     let app = app(state.clone());
 
-    let (status, _, _) = send(&app, "/api/album/root").await;
+    let (status, _, _) = send(&app, "/api/albums/root").await;
     assert_eq!(status, StatusCode::NOT_FOUND);
 
     let albums: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM albums")
@@ -279,7 +326,7 @@ async fn requests_never_create_the_root_album() {
 
     // Startup is the only place that bootstraps storage.
     state.initialize().await.unwrap();
-    let (status, _, _) = send(&app, "/api/album/root").await;
+    let (status, _, _) = send(&app, "/api/albums/root").await;
     assert_eq!(status, StatusCode::OK);
 
     drop(dir);
@@ -291,7 +338,7 @@ async fn album_by_hash_and_unknown_hash() {
     let album = insert_album(&state.db, "Trip", "abc123").await;
     let app = app(state);
 
-    let (status, _, body) = send(&app, "/api/album/abc123").await;
+    let (status, _, body) = send(&app, "/api/albums/abc123").await;
     assert_eq!(status, StatusCode::OK);
     let fetched = parse_album_info(&body).album;
 
@@ -304,7 +351,7 @@ async fn album_by_hash_and_unknown_hash() {
     assert_eq!(fetched.parent_id, album.parent_id);
     assert_eq!(fetched.created_at, album.created_at);
 
-    let (status, _, _) = send(&app, "/api/album/nope").await;
+    let (status, _, _) = send(&app, "/api/albums/nope").await;
     assert_eq!(status, StatusCode::NOT_FOUND);
 
     drop(dir);
@@ -334,7 +381,7 @@ async fn media_listing_is_paginated_and_sorted_by_date_by_default() {
 
     let app = app(state);
 
-    let (status, _, body) = send(&app, "/api/album/abc123/media?page=2&limit=2").await;
+    let (status, _, body) = send(&app, "/api/albums/abc123/media?page=2&limit=2").await;
     assert_eq!(status, StatusCode::OK);
     let page = parse_page(&body);
     assert_eq!(page.total, 5);
@@ -345,7 +392,7 @@ async fn media_listing_is_paginated_and_sorted_by_date_by_default() {
     assert_eq!(names, vec!["m3.jpg", "m4.jpg"]);
 
     // Default limit is 30.
-    let (_, _, body) = send(&app, "/api/album/abc123/media").await;
+    let (_, _, body) = send(&app, "/api/albums/abc123/media").await;
     let page = parse_page(&body);
     assert_eq!(page.limit, 30);
     assert_eq!(page.items.len(), 5);
@@ -370,7 +417,7 @@ async fn name_sort_is_natural_and_reversible() {
 
     let app = app(state);
 
-    let (_, _, body) = send(&app, "/api/album/abc123/media?sort=name").await;
+    let (_, _, body) = send(&app, "/api/albums/abc123/media?sort=name").await;
     let names: Vec<_> = parse_page(&body)
         .items
         .into_iter()
@@ -378,7 +425,7 @@ async fn name_sort_is_natural_and_reversible() {
         .collect();
     assert_eq!(names, vec!["img1.jpg", "img2.jpg", "img10.jpg"]);
 
-    let (_, _, body) = send(&app, "/api/album/abc123/media?sort=-name").await;
+    let (_, _, body) = send(&app, "/api/albums/abc123/media?sort=-name").await;
     let names: Vec<_> = parse_page(&body)
         .items
         .into_iter()
@@ -406,7 +453,7 @@ async fn size_sort_is_supported() {
 
     let app = app(state);
 
-    let (_, _, body) = send(&app, "/api/album/abc123/media?sort=-size").await;
+    let (_, _, body) = send(&app, "/api/albums/abc123/media?sort=-size").await;
     let names: Vec<_> = parse_page(&body)
         .items
         .into_iter()
@@ -424,11 +471,11 @@ async fn invalid_pagination_and_sort_are_bad_requests() {
     let app = app(state);
 
     for uri in [
-        "/api/album/abc123/media?page=0",
-        "/api/album/abc123/media?limit=0",
-        "/api/album/abc123/media?limit=101",
-        "/api/album/abc123/media?sort=width",
-        "/api/album/abc123/media?sort=--name",
+        "/api/albums/abc123/media?page=0",
+        "/api/albums/abc123/media?limit=0",
+        "/api/albums/abc123/media?limit=101",
+        "/api/albums/abc123/media?sort=width",
+        "/api/albums/abc123/media?sort=--name",
     ] {
         let (status, _, body) = send(&app, uri).await;
         assert_eq!(status, StatusCode::BAD_REQUEST, "uri: {uri}");
@@ -482,7 +529,7 @@ async fn root_album_files_live_directly_in_media_dir() {
     let (dir, state) = setup().await;
     let app = app(state.clone());
 
-    let (status, _, body) = send(&app, "/api/album/root").await;
+    let (status, _, body) = send(&app, "/api/albums/root").await;
     assert_eq!(status, StatusCode::OK);
     let root = parse_album_info(&body).album;
 
@@ -735,7 +782,7 @@ async fn album_info_is_wrapped_and_syncs_only_when_stale() {
     let app = app(state.clone());
 
     // Fresh album: wrapped in `album`, no sync notice.
-    let (status, _, body) = send(&app, "/api/album/root").await;
+    let (status, _, body) = send(&app, "/api/albums/root").await;
     assert_eq!(status, StatusCode::OK);
     let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
     assert!(json.get("hash").is_none(), "album must be wrapped");
@@ -749,19 +796,19 @@ async fn album_info_is_wrapped_and_syncs_only_when_stale() {
         Some(Utc::now() - chrono::Duration::minutes(30)),
     )
     .await;
-    let (_, _, body) = send(&app, "/api/album/root").await;
+    let (_, _, body) = send(&app, "/api/albums/root").await;
     assert!(parse_album_info(&body).sync.is_none());
 
     // Older than an hour starts exactly one background task.
     let stale = Utc::now() - chrono::Duration::minutes(61);
     set_indexed_at(&state, root_id, Some(stale)).await;
-    let (_, _, body) = send(&app, "/api/album/root").await;
+    let (_, _, body) = send(&app, "/api/albums/root").await;
     assert_eq!(parse_album_info(&body).sync.as_deref(), Some("started"));
 
     wait_for_indexed(&state, root_id, stale).await;
 
     // Once done the index is fresh again: no second task.
-    let (_, _, body) = send(&app, "/api/album/root").await;
+    let (_, _, body) = send(&app, "/api/albums/root").await;
     assert!(parse_album_info(&body).sync.is_none());
 
     drop(dir);
@@ -789,7 +836,7 @@ async fn sync_indexes_files_and_discovers_child_albums() {
     let app = app(state.clone());
     let since = Utc::now() - chrono::Duration::seconds(1);
 
-    let (_, _, body) = send(&app, "/api/album/root").await;
+    let (_, _, body) = send(&app, "/api/albums/root").await;
     assert_eq!(parse_album_info(&body).sync.as_deref(), Some("started"));
     wait_for_indexed(&state, root_id, since).await;
 
@@ -874,7 +921,7 @@ async fn sync_indexes_files_and_discovers_child_albums() {
 
     // Requesting the child indexes its own folder on demand.
     let winter_since = Utc::now() - chrono::Duration::seconds(1);
-    let (_, _, body) = send(&app, &format!("/api/album/{}", winter.hash)).await;
+    let (_, _, body) = send(&app, &format!("/api/albums/{}", winter.hash)).await;
     assert_eq!(parse_album_info(&body).sync.as_deref(), Some("started"));
     wait_for_indexed(&state, winter.id, winter_since).await;
 
@@ -918,7 +965,7 @@ async fn resync_removes_media_that_disappeared() {
     set_indexed_at(&state, root_id, None).await;
     let app = app(state.clone());
     let since = Utc::now() - chrono::Duration::seconds(1);
-    let _ = send(&app, "/api/album/root").await;
+    let _ = send(&app, "/api/albums/root").await;
     wait_for_indexed(&state, root_id, since).await;
 
     std::fs::remove_file(media_dir.join("drop.jpg")).unwrap();
@@ -926,7 +973,7 @@ async fn resync_removes_media_that_disappeared() {
 
     let stale = Utc::now() - chrono::Duration::hours(2);
     set_indexed_at(&state, root_id, Some(stale)).await;
-    let (_, _, body) = send(&app, "/api/album/root").await;
+    let (_, _, body) = send(&app, "/api/albums/root").await;
     assert_eq!(parse_album_info(&body).sync.as_deref(), Some("started"));
     wait_for_indexed(&state, root_id, stale).await;
 
@@ -937,6 +984,283 @@ async fn resync_removes_media_that_disappeared() {
             .await
             .unwrap();
     assert_eq!(names, vec!["keep.jpg", "new.png"]);
+
+    drop(dir);
+}
+#[tokio::test]
+async fn root_and_album_pages_are_spa_for_people_and_og_for_bots() {
+    let (dir, state) = setup().await;
+    let album = insert_album(&state.db, "Trip & Fun", "trip").await;
+    insert_media(
+        &state.db,
+        album.id,
+        NewMedia {
+            name: "cat.jpg",
+            hash: "h1",
+            date: Some(at(1)),
+            size: 8,
+        },
+    )
+    .await;
+
+    let app = app(state);
+
+    let (status, headers, body) = send(&app, "/trip").await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        headers[header::CONTENT_TYPE]
+            .to_str()
+            .unwrap()
+            .starts_with("text/html")
+    );
+    let html = String::from_utf8_lossy(&body);
+    assert!(html.contains("id=\"app\""), "SPA shell expected");
+
+    let (status, _, body) = send(&app, "/").await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(String::from_utf8_lossy(&body).contains("id=\"app\""));
+
+    let mut bot = HeaderMap::new();
+    bot.insert(
+        header::USER_AGENT,
+        HeaderValue::from_static("Twitterbot/1.0"),
+    );
+    let (status, _, body) = send_with(&app, Method::GET, "/trip", bot.clone()).await;
+    assert_eq!(status, StatusCode::OK);
+    let html = String::from_utf8_lossy(&body);
+    assert!(html.contains("og:title"), "OG title missing: {html}");
+    assert!(
+        html.contains("Trip &amp; Fun"),
+        "album name must be escaped"
+    );
+    assert!(html.contains("/files/trip/h1"), "OG image missing");
+    assert!(html.contains("og:image:width"));
+
+    let (status, _, body) = send_with(&app, Method::GET, "/", bot).await;
+    assert_eq!(status, StatusCode::OK);
+    let html = String::from_utf8_lossy(&body);
+    assert!(html.contains("og:site_name"));
+    assert!(html.contains("og:title"));
+
+    let mut bot = HeaderMap::new();
+    bot.insert(
+        header::USER_AGENT,
+        HeaderValue::from_static("Googlebot/2.1"),
+    );
+    let (status, _, body) = send_with(&app, Method::GET, "/missing", bot).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert!(String::from_utf8_lossy(&body).contains("404"));
+
+    drop(dir);
+}
+
+#[tokio::test]
+async fn static_frontend_files_are_served() {
+    let (dir, state) = setup().await;
+    let app = app(state);
+
+    for (path, needle, content_type) in [
+        ("/public/app.js", "load-more", "javascript"),
+        ("/public/style.css", "--accent", "css"),
+        ("/public/favicon.svg", "<svg", "svg"),
+        ("/public/favicon.ico", "", "icon"),
+    ] {
+        let (status, headers, body) = send(&app, path).await;
+        assert_eq!(status, StatusCode::OK, "path: {path}");
+        let got_type = headers[header::CONTENT_TYPE]
+            .to_str()
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        assert!(
+            got_type.contains(content_type),
+            "path: {path}, content-type: {got_type}"
+        );
+        if !needle.is_empty() {
+            assert!(
+                String::from_utf8_lossy(&body).contains(needle),
+                "path: {path}"
+            );
+        }
+    }
+
+    // API and file namespaces must keep returning JSON/plain 404, not the SPA.
+    let (status, headers, _) = send(&app, "/api/nope").await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert!(
+        headers[header::CONTENT_TYPE]
+            .to_str()
+            .unwrap_or_default()
+            .contains("json")
+    );
+
+    drop(dir);
+}
+#[tokio::test]
+async fn manual_index_honours_force_and_bare_flags() {
+    let (dir, state) = setup().await;
+    let album = insert_album(&state.db, "Trip", "trip").await;
+    let album_dir = state.media_dir.join("trip");
+    std::fs::create_dir_all(&album_dir).unwrap();
+    std::fs::write(album_dir.join("a.jpg"), b"a").unwrap();
+    set_indexed_at(&state, album.id, Some(Utc::now())).await;
+
+    let app = app(state.clone());
+
+    let (status, _, body) = send(&app, "/api/albums/trip/index").await;
+    assert_eq!(status, StatusCode::OK);
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(json["sync"], "fresh");
+
+    let since = Utc::now() - chrono::Duration::seconds(1);
+    let (status, _, body) = send(&app, "/api/albums/trip/index?force&nested").await;
+    assert_eq!(status, StatusCode::OK);
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(json["sync"], "started");
+
+    wait_for_indexed(&state, album.id, since).await;
+    wait_for_media_count(&state, "trip", 1).await;
+
+    drop(dir);
+}
+
+#[tokio::test]
+async fn nested_index_walks_descendants() {
+    let (dir, state) = setup().await;
+    let root = insert_album(&state.db, "Trip", "trip").await;
+    let root_dir = state.media_dir.join("trip");
+    let winter_dir = root_dir.join("winter");
+    let deep_dir = winter_dir.join("deep");
+    std::fs::create_dir_all(&deep_dir).unwrap();
+    std::fs::write(root_dir.join("a.jpg"), b"a").unwrap();
+    std::fs::write(winter_dir.join("b.jpg"), b"b").unwrap();
+    std::fs::write(deep_dir.join("c.jpg"), b"c").unwrap();
+
+    let app = app(state.clone());
+    let (status, _, body) = send(&app, "/api/albums/trip/index?force&nested").await;
+    assert_eq!(status, StatusCode::OK);
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(json["sync"], "started");
+
+    wait_for_media_count(&state, "trip", 3).await;
+
+    let rows: Vec<(String, Option<DateTime<Utc>>)> = sqlx::query_as(
+        "SELECT path, indexed_at FROM albums WHERE path IN ('trip/winter', 'trip/winter/deep') ORDER BY path",
+    )
+    .fetch_all(&state.db)
+    .await
+    .unwrap();
+    assert_eq!(rows.len(), 2, "nested albums must exist");
+    assert_eq!(rows[0].0, "trip/winter");
+    assert!(rows[0].1.is_some());
+    assert_eq!(rows[1].0, "trip/winter/deep");
+    assert!(rows[1].1.is_some());
+
+    wait_for_indexed(&state, root.id, Utc::now() - chrono::Duration::seconds(1)).await;
+
+    drop(dir);
+}
+
+#[tokio::test]
+async fn index_sse_reports_progress_and_completion() {
+    let (dir, state) = setup().await;
+    let album = insert_album(&state.db, "Trip", "trip").await;
+    let album_dir = state.media_dir.join("trip");
+    std::fs::create_dir_all(&album_dir).unwrap();
+    std::fs::write(album_dir.join("a.jpg"), b"a").unwrap();
+
+    let app = app(state.clone());
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/albums/trip/index/events")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert!(
+        response.headers()[header::CONTENT_TYPE]
+            .to_str()
+            .unwrap()
+            .starts_with("text/event-stream")
+    );
+
+    let mut body = response.into_body().into_data_stream();
+
+    let (status, _, _) = send(&app, "/api/albums/trip/index?force").await;
+    assert_eq!(status, StatusCode::OK);
+
+    let mut text = String::new();
+    for _ in 0..50 {
+        let next = tokio::time::timeout(Duration::from_secs(3), body.next()).await;
+        let Ok(Some(Ok(chunk))) = next else {
+            break;
+        };
+        text.push_str(&String::from_utf8_lossy(&chunk));
+        if text.contains("\"done\":true") {
+            break;
+        }
+    }
+
+    assert!(text.contains("\"done\":true"), "SSE output: {text}");
+    assert!(text.contains("\"new_media\":1"), "SSE output: {text}");
+    assert!(text.contains("\"files_total\":1"), "SSE output: {text}");
+
+    wait_for_indexed(&state, album.id, Utc::now() - chrono::Duration::seconds(1)).await;
+
+    drop(dir);
+}
+#[tokio::test]
+async fn symlinked_album_directory_is_indexed() {
+    let (dir, state) = setup().await;
+    let target = dir.path().join("linked-album");
+    std::fs::create_dir_all(&target).unwrap();
+    std::fs::write(target.join("photo.jpg"), b"x").unwrap();
+
+    let link = state.media_dir.join("Moe");
+    if !create_dir_link(&link, &target) {
+        eprintln!("skipping symlink test: cannot create directory link");
+        return;
+    }
+
+    let app = app(state.clone());
+    let root_id = root_album_id(&state).await;
+    set_indexed_at(&state, root_id, None).await;
+    let since = Utc::now() - chrono::Duration::seconds(1);
+    let (status, _, _) = send(&app, "/api/albums/root/index?force").await;
+    assert_eq!(status, StatusCode::OK);
+    wait_for_indexed(&state, root_id, since).await;
+
+    let moe: Album = sqlx::query_as(
+        "SELECT id, name, hash, parent_id, path, indexed_at, sort_name, created_at, updated_at \
+         FROM albums WHERE path = 'Moe'",
+    )
+    .fetch_one(&state.db)
+    .await
+    .unwrap();
+
+    let since = Utc::now() - chrono::Duration::seconds(1);
+    let (status, _, _) = send(&app, &format!("/api/albums/{}/index?force", moe.hash)).await;
+    assert_eq!(status, StatusCode::OK);
+    wait_for_indexed(&state, moe.id, since).await;
+    wait_for_media_count(&state, "Moe", 1).await;
+
+    let media_hash: String = sqlx::query_scalar("SELECT hash FROM media WHERE album_id = ?1")
+        .bind(moe.id)
+        .fetch_one(&state.db)
+        .await
+        .unwrap();
+    let (status, _, body) = send(&app, &format!("/files/{}/{}", moe.hash, media_hash)).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body, b"x");
+
+    #[cfg(windows)]
+    std::fs::remove_dir(&link).ok();
+    #[cfg(unix)]
+    std::fs::remove_file(&link).ok();
 
     drop(dir);
 }

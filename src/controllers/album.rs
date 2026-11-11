@@ -32,7 +32,7 @@ pub struct AlbumPage {
     pub pages: i64,
 }
 
-/// Response of `GET /api/album/{hash}`.
+/// Response of `GET /api/albums/{hash}`.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct AlbumInfo {
     pub album: Album,
@@ -120,7 +120,7 @@ pub async fn list_children(
     }))
 }
 
-/// `GET /api/album/{hash}` — `hash` may be the literal `root`.
+/// `GET /api/albums/{hash}` — `hash` may be the literal `root`.
 ///
 /// Starts a background filesystem sync when the album was never indexed or its
 /// index is older than an hour. The response is wrapped in an `album` key.

@@ -6,7 +6,7 @@ use axum::body::Body;
 use axum::extract::{Request, State};
 use axum::http::header::{CACHE_CONTROL, CONTENT_TYPE, HOST, USER_AGENT};
 use axum::http::{HeaderMap, HeaderValue, StatusCode};
-use axum::response::{Redirect, Response};
+use axum::response::{Response};
 
 use crate::controllers::album::resolve_album;
 use crate::error::AppError;
@@ -41,23 +41,12 @@ pub async fn root_page(
     render_bot_page(&state, &album, &headers).await
 }
 
-/// `GET /favicon.ico` — browsers often request it without following the HTML link.
-pub async fn favicon() -> Redirect {
-    Redirect::permanent("/public/favicon.ico")
-}
-
 /// Fallback for `/<albumHash>` and other SPA routes.
-pub async fn spa(
-    State(state): State<AppState>,
-    request: Request,
-) -> Result<Response, AppError> {
+pub async fn spa(State(state): State<AppState>, request: Request) -> Result<Response, AppError> {
     let path = request.uri().path().to_owned();
 
     // API/file/static paths must stay 404s instead of turning into HTML.
-    if path.starts_with("/api")
-        || path.starts_with("/files")
-        || path.starts_with("/public")
-    {
+    if path.starts_with("/api") || path.starts_with("/files") || path.starts_with("/public") {
         return Err(AppError::NotFound);
     }
 
@@ -101,11 +90,10 @@ async fn render_bot_page(
     .fetch_optional(&state.db)
     .await?;
 
-    let media_count: i64 =
-        sqlx::query_scalar("SELECT COUNT(*) FROM media WHERE album_id = ?1")
-            .bind(album.id)
-            .fetch_one(&state.db)
-            .await?;
+    let media_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM media WHERE album_id = ?1")
+        .bind(album.id)
+        .fetch_one(&state.db)
+        .await?;
 
     let title = if is_root {
         SITE_NAME.to_string()

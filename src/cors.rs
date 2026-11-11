@@ -1,8 +1,9 @@
 //! CORS for the whole application.
 //!
-//! The API is public and read-only, so any origin may read it. `Range` and the
-//! conditional headers browsers send for cached files are allowed, and the
-//! headers needed to consume partial/cached responses are exposed.
+//! The API is public: reads are open to any origin and indexing is started with
+//! `POST`. `Range` and the conditional headers browsers send for cached files
+//! are allowed, and the headers needed to consume partial/cached responses are
+//! exposed.
 
 use std::time::Duration;
 
@@ -17,7 +18,7 @@ use tower_http::cors::{Any, CorsLayer};
 pub fn layer() -> CorsLayer {
     CorsLayer::new()
         .allow_origin(Any)
-        .allow_methods([Method::GET, Method::HEAD, Method::OPTIONS])
+        .allow_methods([Method::GET, Method::HEAD, Method::POST, Method::OPTIONS])
         .allow_headers([
             ACCEPT,
             CONTENT_TYPE,
