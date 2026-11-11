@@ -17,8 +17,21 @@ use wepics_axum::models::{Album, Media, MediaType, ROOT_ALBUM_HASH, natural_sort
 use wepics_axum::routes;
 use wepics_axum::state::AppState;
 
+/// Temporary directory under `target/`.
+///
+/// The system temp directory is not always writable for the test binary (some
+/// Windows setups deny it), while `target/` always is.
+fn workspace_tempdir() -> TempDir {
+    let base = Path::new("target").join("tmp");
+    std::fs::create_dir_all(&base).unwrap();
+    tempfile::Builder::new()
+        .prefix("test-")
+        .tempdir_in(&base)
+        .unwrap()
+}
+
 async fn setup_raw() -> (TempDir, AppState) {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = workspace_tempdir();
 
     let options = SqliteConnectOptions::from_str("sqlite::memory:")
         .unwrap()
