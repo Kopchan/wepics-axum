@@ -16,6 +16,9 @@ use crate::index_hub::{IndexEvent, IndexHub, IndexPhase};
 use crate::models::{Album, MediaType, natural_sort_key};
 use crate::state::{AppState, is_safe_segment};
 
+/// How many media rows are written per transaction.
+const INSERT_BATCH: usize = 100;
+
 /// An album is re-indexed when its index is older than this.
 const STALE_AFTER_HOURS: i64 = 1;
 
@@ -198,16 +201,15 @@ async fn sync_one(
         progress.publish(album, IndexPhase::Scanning, false, None);
     }
 
-    // SQLite allows one writer; serializing here also prevents deferred
-    // transactions from deadlocking each other on the upgrade to a write lock.
-    let _write_guard = state.lock_writes().await;
-    let mut tx = state.db.begin().await?;
-
+    // Snapshot of the current rows: used to count new media and to delete rows
+    // whose files disappeared. The album is claimed exclusively, so a plain
+    // read is enough here.
     let existing: Vec<(i64, String)> =
         sqlx::query_as("SELECT id, name FROM media WHERE album_id = ?1")
             .bind(album.id)
-            .fetch_all(&mut *tx)
-            .await?;
+            .fetch_all(&state.db)
+            .await
+            .map_err(|err| step("select existing media", err))?;
 
     let existing_names: HashSet<&str> = existing.iter().map(|(_, name)| name.as_str()).collect();
     let new_media = scan
@@ -215,65 +217,109 @@ async fn sync_one(
         .iter()
         .filter(|file| !existing_names.contains(file.name.as_str()))
         .count() as u64;
+    progress.new_media += new_media;
 
-    for file in &scan.files {
-        sqlx::query(UPSERT_MEDIA)
-            .bind(&file.name)
-            .bind(file.media_type)
-            .bind(album.id)
-            .bind(file.size)
-            .bind(file.date)
-            .bind(&file.sort_name)
-            .execute(&mut *tx)
-            .await?;
-    }
+    // Media are written in batches, each in its own transaction: SQLite's
+    // write lock is released between batches and the UI sees progress without
+    // waiting for a folder of thousands of files. Upserts are idempotent, so a
+    // failure mid-way is repaired by the next sync (indexed_at is only bumped
+    // once everything, including deletions, has landed).
+    for (batch_index, batch) in scan.files.chunks(INSERT_BATCH).enumerate() {
+        let write_guard = state.lock_writes().await;
+        let mut tx = state
+            .db
+            .begin()
+            .await
+            .map_err(|err| step("begin media batch", err))?;
 
-    let observed: HashSet<&str> = scan.files.iter().map(|file| file.name.as_str()).collect();
-    for (id, name) in &existing {
-        if !observed.contains(name.as_str()) {
-            sqlx::query("DELETE FROM media WHERE id = ?1")
-                .bind(id)
+        for file in batch {
+            sqlx::query(UPSERT_MEDIA)
+                .bind(&file.name)
+                .bind(file.media_type)
+                .bind(album.id)
+                .bind(file.size)
+                .bind(file.date)
+                .bind(&file.sort_name)
                 .execute(&mut *tx)
-                .await?;
+                .await
+                .map_err(|err| {
+                    step(
+                        &format!("upsert `{}` (batch {})", file.name, batch_index + 1),
+                        err,
+                    )
+                })?;
         }
+
+        tx.commit()
+            .await
+            .map_err(|err| step(&format!("commit media batch {}", batch_index + 1), err))?;
+        drop(write_guard);
+
+        progress.files_done += batch.len() as u64;
+        progress.publish(album, IndexPhase::Indexing, false, None);
     }
 
-    // Subdirectories are child albums. They are created here and indexed
-    // lazily when their own info is requested, or as part of a nested job.
-    let mut new_albums = 0_u64;
-    for child in &scan.dirs {
-        let inserted = sqlx::query(
-            "INSERT INTO albums (name, hash, sort_name, parent_id, path)
-             VALUES (?1, lower(hex(randomblob(12))), ?2, ?3, ?4)
-             ON CONFLICT(path) DO NOTHING",
-        )
-        .bind(&child.name)
-        .bind(natural_sort_key(&child.name))
-        .bind(album.id)
-        .bind(&child.path)
-        .execute(&mut *tx)
-        .await?;
-        new_albums += inserted.rows_affected();
-    }
+    let (children, new_albums) = {
+        let _write_guard = state.lock_writes().await;
+        let mut tx = state
+            .db
+            .begin()
+            .await
+            .map_err(|err| step("begin metadata transaction", err))?;
 
-    let children: Vec<i64> =
-        sqlx::query_scalar("SELECT id FROM albums WHERE parent_id = ?1 ORDER BY sort_name, id")
+        let observed: HashSet<&str> = scan.files.iter().map(|file| file.name.as_str()).collect();
+        for (id, name) in &existing {
+            if !observed.contains(name.as_str()) {
+                sqlx::query("DELETE FROM media WHERE id = ?1")
+                    .bind(id)
+                    .execute(&mut *tx)
+                    .await
+                    .map_err(|err| step(&format!("delete `{name}`"), err))?;
+            }
+        }
+
+        // Subdirectories are child albums. They are created here and indexed
+        // lazily when their own info is requested, or as part of a nested job.
+        let mut new_albums = 0_u64;
+        for child in &scan.dirs {
+            let inserted = sqlx::query(
+                "INSERT INTO albums (name, hash, sort_name, parent_id, path)
+                 VALUES (?1, lower(hex(randomblob(12))), ?2, ?3, ?4)
+                 ON CONFLICT(path) DO NOTHING",
+            )
+            .bind(&child.name)
+            .bind(natural_sort_key(&child.name))
             .bind(album.id)
-            .fetch_all(&mut *tx)
-            .await?;
+            .bind(&child.path)
+            .execute(&mut *tx)
+            .await
+            .map_err(|err| step(&format!("insert child album `{}`", child.name), err))?;
+            new_albums += inserted.rows_affected();
+        }
 
-    sqlx::query("UPDATE albums SET indexed_at = ?1 WHERE id = ?2")
-        .bind(Utc::now())
-        .bind(album.id)
-        .execute(&mut *tx)
-        .await?;
+        let children: Vec<i64> =
+            sqlx::query_scalar("SELECT id FROM albums WHERE parent_id = ?1 ORDER BY sort_name, id")
+                .bind(album.id)
+                .fetch_all(&mut *tx)
+                .await
+                .map_err(|err| step("select child albums", err))?;
 
-    tx.commit().await?;
+        sqlx::query("UPDATE albums SET indexed_at = ?1 WHERE id = ?2")
+            .bind(Utc::now())
+            .bind(album.id)
+            .execute(&mut *tx)
+            .await
+            .map_err(|err| step("update album indexed_at", err))?;
 
-    progress.files_done += scan.files.len() as u64;
+        tx.commit()
+            .await
+            .map_err(|err| step("commit metadata transaction", err))?;
+
+        (children, new_albums)
+    };
+
     progress.dirs_done += scan.dirs.len() as u64;
     progress.new_albums += new_albums;
-    progress.new_media += new_media;
     progress.publish(album, IndexPhase::Indexing, false, None);
 
     Ok(AlbumSyncStats { children })
@@ -521,6 +567,11 @@ fn media_type_for(path: &Path) -> Option<MediaType> {
 }
 
 type IndexResult<T> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
+
+/// Adds the failing step to an error, so a bare `(code: 14)` becomes actionable.
+fn step<E: std::fmt::Display>(context: &str, error: E) -> Box<dyn std::error::Error + Send + Sync> {
+    format!("{context}: {error}").into()
+}
 
 #[cfg(test)]
 mod tests {

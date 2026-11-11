@@ -6,7 +6,7 @@ use axum::body::Body;
 use axum::extract::{Request, State};
 use axum::http::header::{CACHE_CONTROL, CONTENT_TYPE, HOST, USER_AGENT};
 use axum::http::{HeaderMap, HeaderValue, StatusCode};
-use axum::response::{Response};
+use axum::response::Response;
 
 use crate::controllers::album::resolve_album;
 use crate::error::AppError;

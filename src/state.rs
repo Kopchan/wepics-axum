@@ -47,6 +47,10 @@ impl AppState {
             .foreign_keys(true)
             // Background album syncs used to collide on the rollback journal.
             .journal_mode(SqliteJournalMode::Wal)
+            // Every upsert opens a statement journal. On this Windows setup
+            // creating those temp files eventually fails with
+            // `(code: 14) unable to open database file`, so keep them in RAM.
+            .pragma("temp_store", "MEMORY")
             .busy_timeout(Duration::from_secs(30));
 
         // `create_if_missing` creates the file, not its parent directory.
