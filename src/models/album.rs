@@ -2,7 +2,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use sqlx::FromRow;
 
-/// Hash used in URLs to address the root album: `/api/album/root`.
+/// Hash used in URLs to address the root album: `/api/albums/root`.
 pub const ROOT_ALBUM_HASH: &str = "root";
 
 /// A folder that groups media. Albums can be nested via `parent_id`.

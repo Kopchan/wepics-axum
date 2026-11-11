@@ -2,10 +2,12 @@ use std::collections::HashSet;
 use std::path::PathBuf;
 use std::str::FromStr;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use sqlx::SqlitePool;
-use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
+use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions};
 
+use crate::index_hub::IndexHub;
 use crate::models::{Album, Media, ROOT_ALBUM_HASH};
 
 /// Shared application state, cloned into every handler by axum.
@@ -16,6 +18,10 @@ pub struct AppState {
     pub media_dir: PathBuf,
     /// Albums with a background indexing task in flight.
     syncing: SyncTracker,
+    /// Serializes indexing transactions: SQLite has one writer at a time.
+    write_gate: Arc<tokio::sync::Mutex<()>>,
+    /// Progress broadcast for running index jobs.
+    index_hub: IndexHub,
 }
 
 impl AppState {
@@ -24,6 +30,8 @@ impl AppState {
             db,
             media_dir: media_dir.into(),
             syncing: SyncTracker::default(),
+            write_gate: Arc::new(tokio::sync::Mutex::new(())),
+            index_hub: IndexHub::default(),
         }
     }
 
@@ -36,7 +44,10 @@ impl AppState {
         let options = SqliteConnectOptions::from_str(database_url)?
             .create_if_missing(true)
             // SQLite does not enforce FKs unless asked to.
-            .foreign_keys(true);
+            .foreign_keys(true)
+            // Background album syncs used to collide on the rollback journal.
+            .journal_mode(SqliteJournalMode::Wal)
+            .busy_timeout(Duration::from_secs(30));
 
         // `create_if_missing` creates the file, not its parent directory.
         if let Some(parent) = options.get_filename().parent()
@@ -105,6 +116,15 @@ impl AppState {
     /// Marks `album_id` as syncing. `None` means another task already owns it.
     pub(crate) fn try_claim_sync(&self, album_id: i64) -> Option<SyncGuard> {
         self.syncing.try_claim(album_id)
+    }
+
+    /// Serializes database-writing sync transactions across albums.
+    pub(crate) async fn lock_writes(&self) -> tokio::sync::MutexGuard<'_, ()> {
+        self.write_gate.lock().await
+    }
+
+    pub(crate) fn index_hub(&self) -> &IndexHub {
+        &self.index_hub
     }
 }
 

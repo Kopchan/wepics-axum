@@ -22,7 +22,7 @@ const CACHE_CONTROL_VALUE: &str = "public, max-age=31536000, immutable";
 const MEDIA_SELECT: &str = "SELECT id, name, hash, \"type\", album_id, width, height, \
      duration_sec, date, size, sort_name, created_at, updated_at FROM media";
 
-/// `GET /api/album/{hash}/media?page=1&limit=30&sort=date`
+/// `GET /api/albums/{hash}/media?page=1&limit=30&sort=date`
 #[derive(Debug, Deserialize)]
 pub struct MediaQuery {
     pub page: Option<u32>,

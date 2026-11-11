@@ -1,0 +1,99 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>wepics</title>
+  <meta name="description" content="Фотографии и видео, собранные в альбомы.">
+  <link rel="icon" href="/favicon.svg" type="image/svg+xml">
+  <link rel="alternate icon" href="/favicon.ico">
+  <link rel="stylesheet" href="/style.css">
+</head>
+<body>
+  <header class="topbar">
+    <a class="brand" href="/" data-album="root" aria-label="wepics — на главную">
+      <span class="brand-mark" aria-hidden="true">◈</span>
+      <span>wepics</span>
+    </a>
+    <div class="sorts" aria-label="Сортировка">
+      <label>Медиа
+        <select id="media-sort">
+          <option value="date">Дата ↑</option>
+          <option value="-date">Дата ↓</option>
+          <option value="name">Имя ↑</option>
+          <option value="-name">Имя ↓</option>
+          <option value="size">Размер ↑</option>
+          <option value="-size">Размер ↓</option>
+        </select>
+      </label>
+      <label>Альбомы
+        <select id="album-sort">
+          <option value="name">Имя ↑</option>
+          <option value="-name">Имя ↓</option>
+          <option value="created_at">Создан ↑</option>
+          <option value="-created_at">Создан ↓</option>
+        </select>
+      </label>
+    </div>
+  </header>
+
+  <main id="app" class="page">
+    <div id="status" class="status" role="status" aria-live="polite" hidden></div>
+
+    <section id="album-head" class="album-head" hidden>
+      <p class="eyebrow">Альбом</p>
+      <h1 id="album-title"></h1>
+      <p id="album-meta" class="muted"></p>
+
+      <div class="album-tools">
+        <div class="index-control" id="index-control">
+          <button id="index-button" class="button index-button" type="button" title="Индексировать альбом">
+            <span id="index-spinner" class="spinner" aria-hidden="true"></span>
+            <span id="index-button-label">Индексировать</span>
+          </button>
+          <label class="nested-toggle" title="Индексировать вложенные альбомы">
+            <input type="checkbox" id="nested-index">
+            вложенные
+          </label>
+        </div>
+        <div id="index-progress" class="index-progress" hidden>
+          <div class="progress"><span id="index-progress-fill"></span></div>
+          <span id="index-progress-text" class="muted"></span>
+        </div>
+      </div>
+
+      <div id="index-result" class="index-result" hidden>
+        <p id="index-result-text"></p>
+        <div class="index-result-actions">
+          <button id="index-refresh" class="button small" type="button">Обновить</button>
+          <button id="index-dismiss" class="button ghost small" type="button">Скрыть</button>
+        </div>
+      </div>
+    </section>
+
+    <section id="children-section" class="section" hidden>
+      <div class="section-head">
+        <h2>Вложенные альбомы</h2>
+        <span id="children-count" class="muted"></span>
+      </div>
+      <div id="children-list" class="album-grid"></div>
+    </section>
+
+    <section id="media-section" class="section" hidden>
+      <div class="section-head">
+        <h2>Медиа</h2>
+        <span id="media-count" class="muted"></span>
+      </div>
+      <div id="media-list" class="media-grid"></div>
+      <p id="media-empty" class="empty" hidden>В альбоме пока нет медиа.</p>
+      <div class="more-wrap">
+        <button id="load-more" class="button" type="button" hidden>Загрузить ещё</button>
+      </div>
+    </section>
+
+    <noscript><p class="empty">Для просмотра галереи нужен JavaScript.</p></noscript>
+  </main>
+
+  <script src="/app.js" defer></script>
+</body>
+</html>

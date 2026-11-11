@@ -1,6 +1,7 @@
 pub mod controllers;
 pub mod cors;
 pub mod error;
+pub mod index_hub;
 pub mod indexer;
 pub mod models;
 pub mod routes;
