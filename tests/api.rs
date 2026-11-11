@@ -1088,6 +1088,13 @@ async fn static_frontend_files_are_served() {
             got_type.contains(content_type),
             "path: {path}, content-type: {got_type}"
         );
+        // Assets carry no content hash, so a stale cached copy would keep
+        // running old JavaScript after an update.
+        assert_eq!(
+            headers[header::CACHE_CONTROL].to_str().unwrap_or_default(),
+            "no-cache",
+            "path: {path}"
+        );
         if !needle.is_empty() {
             assert!(
                 String::from_utf8_lossy(&body).contains(needle),
@@ -1095,6 +1102,13 @@ async fn static_frontend_files_are_served() {
             );
         }
     }
+
+    let (status, headers, _) = send(&app, "/").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        headers[header::CACHE_CONTROL].to_str().unwrap_or_default(),
+        "no-cache"
+    );
 
     // API and file namespaces must keep returning JSON/plain 404, not the SPA.
     let (status, headers, _) = send(&app, "/api/nope").await;

@@ -42,10 +42,21 @@ const state = {
   album: null,
   requestId: 0,
   indexBusy: false,
+  mediaTotal: 0,
+  childrenTotal: 0,
+  // `infoReady` is false while the album info and first pages load; a job can
+  // finish during that window, so its `done` event is kept for later.
+  infoReady: false,
+  pendingDone: null,
+  // Lists that were empty when indexing started are refreshed while the job
+  // runs, so a folder indexed for the first time fills up live.
+  liveMedia: false,
+  liveChildren: false,
 };
 
 let eventSource = null;
 let eventsReady = Promise.resolve();
+let liveRefreshTimer = null;
 
 function pathHash() {
   try {
@@ -86,6 +97,15 @@ function setStatus(message, isError = false) {
   els.status.textContent = message ?? "";
   els.status.hidden = !message;
   els.status.classList.toggle("error", Boolean(isError));
+}
+
+const MEDIA_EMPTY_TEXT = "В альбоме пока нет медиа.";
+const MEDIA_INDEXING_TEXT = "Идёт индексация — медиа появятся автоматически.";
+
+function updateMediaEmptyHint() {
+  els.mediaEmpty.textContent = state.liveMedia
+    ? MEDIA_INDEXING_TEXT
+    : MEDIA_EMPTY_TEXT;
 }
 
 function clearAlbum() {
@@ -141,6 +161,59 @@ function showIndexResult(message, isError) {
   els.indexResultText.textContent = message;
 }
 
+function stopLiveRefresh() {
+  if (liveRefreshTimer) {
+    clearTimeout(liveRefreshTimer);
+    liveRefreshTimer = null;
+  }
+  state.liveMedia = false;
+  state.liveChildren = false;
+  updateMediaEmptyHint();
+}
+
+const LIVE_REFRESH_MS = 1000;
+
+async function refreshLiveLists() {
+  if (!state.liveMedia && !state.liveChildren) return;
+  if (state.loading) return;
+
+  const id = state.requestId;
+  const jobs = [];
+  if (state.liveChildren) jobs.push(loadChildren(id));
+  if (state.liveMedia) jobs.push(loadMedia(1, id, false));
+  await Promise.all(jobs);
+}
+
+// Shows the first batch immediately, then coalesces the frequent progress
+// events so the grid is re-rendered at most once per second.
+function scheduleLiveRefresh() {
+  if ((!state.liveMedia && !state.liveChildren) || liveRefreshTimer) return;
+  liveRefreshTimer = setTimeout(() => {
+    liveRefreshTimer = null;
+  }, LIVE_REFRESH_MS);
+  refreshLiveLists();
+}
+
+// Final refresh after the job finished, including lists that were empty.
+async function finishLiveRefresh() {
+  const refreshMedia = state.liveMedia;
+  const refreshChildren = state.liveChildren;
+  stopLiveRefresh();
+  if (!refreshMedia && !refreshChildren) return;
+
+  // A progress refresh may still be in flight; wait for it so the last batch
+  // is not lost when its (slightly older) response wins the race.
+  const id = state.requestId;
+  for (let i = 0; state.loading && i < 40; i += 1) {
+    await new Promise((resolve) => setTimeout(resolve, 50));
+  }
+
+  await Promise.all([
+    refreshChildren ? loadChildren(id) : Promise.resolve(),
+    refreshMedia ? loadMedia(1, id, false) : Promise.resolve(),
+  ]);
+}
+
 function handleIndexEvent(data) {
   if (!data || data.root_hash !== state.hash) return;
 
@@ -150,6 +223,7 @@ function handleIndexEvent(data) {
   const dirsTotal = Number(data.dirs_total) || 0;
 
   if (data.phase === "error") {
+    stopLiveRefresh();
     setIndexBusy(false);
     setStatus("");
     showIndexResult(
@@ -160,14 +234,31 @@ function handleIndexEvent(data) {
   }
 
   if (data.done || data.phase === "done") {
+    if (!state.infoReady) {
+      // Small folders finish in milliseconds, before the first page response
+      // is rendered. Defer the result so the final refresh is not skipped.
+      state.pendingDone = { data, id: state.requestId };
+      return;
+    }
+
+    const live = state.liveMedia || state.liveChildren;
     setIndexBusy(false);
     setStatus("");
+    if (live) {
+      finishLiveRefresh();
+    }
     showIndexResult(
       `Найдено ${Number(data.new_albums) || 0} новых альбомов и ` +
-        `${Number(data.new_media) || 0} новых медиа. Обновить?`,
+        `${Number(data.new_media) || 0} новых медиа.` +
+        (live ? "" : " Обновить?"),
       false,
     );
     return;
+  }
+
+  // Only the indexing phase adds rows; scanning has nothing to show yet.
+  if (data.phase === "indexing") {
+    scheduleLiveRefresh();
   }
 
   setIndexBusy(true);
@@ -221,6 +312,13 @@ async function startIndex() {
   showIndexProgress(0, 0, 0, 0);
   setStatus("");
 
+  // Decide what to refresh before the job starts: a small folder can finish
+  // before the POST response is parsed, making a late decision too late.
+  const neverIndexed = Boolean(state.album && !state.album.indexed_at);
+  state.liveMedia = neverIndexed || state.mediaTotal === 0;
+  state.liveChildren = neverIndexed || state.childrenTotal === 0;
+  updateMediaEmptyHint();
+
   try {
     const nested = els.nestedIndex.checked ? "1" : "0";
     await eventsReady;
@@ -238,9 +336,12 @@ async function startIndex() {
     if (body.sync === "fresh") {
       setIndexBusy(false);
       els.indexProgress.hidden = true;
+      // Nothing was started, so do not wait for events that will not come.
+      stopLiveRefresh();
       setStatus("Индекс уже свежий.");
     }
   } catch (error) {
+    stopLiveRefresh();
     setIndexBusy(false);
     els.indexProgress.hidden = true;
     setStatus(`Не удалось запустить индексацию: ${error.message}`, true);
@@ -284,6 +385,7 @@ function fileUrl(media) {
 
 function renderChildren(page) {
   els.childrenList.replaceChildren();
+  state.childrenTotal = page.total;
   els.childrenSection.hidden = page.items.length === 0;
   els.childrenCount.textContent =
     page.total > page.items.length
@@ -378,6 +480,7 @@ async function loadMedia(pageNumber, id, append) {
 
     state.page = page.page;
     state.pages = page.pages;
+    state.mediaTotal = page.total;
     els.mediaCount.textContent = String(page.total);
     els.mediaEmpty.hidden = page.total !== 0;
     els.mediaSection.hidden = false;
@@ -402,6 +505,11 @@ async function loadAll() {
   state.pages = 0;
   state.album = null;
   state.loading = false;
+  state.mediaTotal = 0;
+  state.childrenTotal = 0;
+  state.infoReady = false;
+  state.pendingDone = null;
+  stopLiveRefresh();
 
   clearAlbum();
   resetIndexUi();
@@ -437,6 +545,28 @@ async function loadAll() {
     }
 
     await Promise.all([loadChildren(id), loadMedia(1, id, false)]);
+    if (id !== state.requestId) return;
+
+    if (info.sync) {
+      // Albums that had nothing to show when the job started are refreshed
+      // from the progress events, so their contents appear as they are
+      // indexed instead of requiring a manual reload. `indexed_at` is checked
+      // as well: a never-indexed album may already have its first rows by the
+      // time this response arrives.
+      const neverIndexed = !info.album.indexed_at;
+      state.liveChildren = neverIndexed || state.childrenTotal === 0;
+      state.liveMedia = neverIndexed || state.mediaTotal === 0;
+      updateMediaEmptyHint();
+    }
+
+    state.infoReady = true;
+    if (state.pendingDone && state.pendingDone.id === id) {
+      // The job already finished while the page was loading: apply its result
+      // now, with the live flags set, so the lists get their final refresh.
+      const pending = state.pendingDone.data;
+      state.pendingDone = null;
+      handleIndexEvent(pending);
+    }
   } catch (error) {
     if (id !== state.requestId) return;
     clearAlbum();

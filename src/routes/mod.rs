@@ -2,12 +2,35 @@ pub mod api;
 pub mod files;
 
 use axum::Router;
+use axum::extract::Request;
+use axum::http::HeaderValue;
+use axum::http::header::CACHE_CONTROL;
+use axum::middleware::{self, Next};
+use axum::response::Response;
 use axum::routing::get;
 use tower_http::services::ServeDir;
 
 use crate::controllers;
 use crate::cors;
 use crate::state::AppState;
+
+/// Frontend assets are served without content hashes, so a cached copy would
+/// keep running old JavaScript after an update. `no-cache` still allows cheap
+/// `304 Not Modified` revalidation via the `ETag`/`Last-Modified` headers.
+async fn revalidate_static(req: Request, next: Next) -> Response {
+    let path = req.uri().path().to_owned();
+    let mut response = next.run(req).await;
+
+    // Media (`/files`) is immutable content and API responses are dynamic;
+    // only the shell and its assets need revalidation.
+    if !(path.starts_with("/api") || path.starts_with("/files")) {
+        response
+            .headers_mut()
+            .insert(CACHE_CONTROL, HeaderValue::from_static("no-cache"));
+    }
+
+    response
+}
 
 /// Full application: static frontend, SPA/SSR pages, API, files and CORS.
 pub fn app(state: AppState) -> Router {
@@ -33,5 +56,6 @@ pub fn app(state: AppState) -> Router {
         .nest("/files", files::router())
         .fallback_service(static_files)
         .layer(cors::layer())
+        .layer(middleware::from_fn(revalidate_static))
         .with_state(state)
 }

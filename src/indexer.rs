@@ -193,11 +193,21 @@ async fn sync_one(
         return Err(format!("album `{}` has an unsafe path", album.hash).into());
     };
 
-    let scan = scan_dir(&dir, &album.path).await?;
+    // Listing names is cheap (no per-file `metadata`), so the total is known
+    // before the slow part starts and the progress bar can advance smoothly.
+    let entries = read_sorted_entries(&dir)
+        .await
+        .map_err(|err| step("read album directory", err))?;
+    let (dirs, media) = classify_entries(entries, &album.path).await;
+
+    // Directories are fully discovered by the listing pass, so count them as
+    // done right away; only the (potentially long) metadata/insert phase is
+    // left to report.
+    progress.dirs_done += dirs.len() as u64;
 
     if count_totals {
-        progress.files_total += scan.files.len() as u64;
-        progress.dirs_total += scan.dirs.len() as u64;
+        progress.files_total += media.len() as u64;
+        progress.dirs_total += dirs.len() as u64;
         progress.publish(album, IndexPhase::Scanning, false, None);
     }
 
@@ -212,50 +222,50 @@ async fn sync_one(
             .map_err(|err| step("select existing media", err))?;
 
     let existing_names: HashSet<&str> = existing.iter().map(|(_, name)| name.as_str()).collect();
-    let new_media = scan
-        .files
-        .iter()
-        .filter(|file| !existing_names.contains(file.name.as_str()))
-        .count() as u64;
-    progress.new_media += new_media;
+    let observed: HashSet<&str> = media.iter().map(|entry| entry.name.as_str()).collect();
 
-    // Media are written in batches, each in its own transaction: SQLite's
-    // write lock is released between batches and the UI sees progress without
-    // waiting for a folder of thousands of files. Upserts are idempotent, so a
-    // failure mid-way is repaired by the next sync (indexed_at is only bumped
-    // once everything, including deletions, has landed).
-    for (batch_index, batch) in scan.files.chunks(INSERT_BATCH).enumerate() {
-        let write_guard = state.lock_writes().await;
-        let mut tx = state
-            .db
-            .begin()
-            .await
-            .map_err(|err| step("begin media batch", err))?;
+    // Scanning and writing are interleaved: every 100 files are committed in
+    // their own transaction while the rest of the folder is still being read.
+    // This keeps the write lock free between batches, makes progress visible
+    // throughout the scan instead of in one burst at the end, and is safe on
+    // failure because upserts are idempotent (`indexed_at` is only bumped once
+    // everything, including deletions, has landed).
+    let mut batch: Vec<ScannedFile> = Vec::with_capacity(INSERT_BATCH);
+    let mut batch_index = 0_usize;
 
-        for file in batch {
-            sqlx::query(UPSERT_MEDIA)
-                .bind(&file.name)
-                .bind(file.media_type)
-                .bind(album.id)
-                .bind(file.size)
-                .bind(file.date)
-                .bind(&file.sort_name)
-                .execute(&mut *tx)
-                .await
-                .map_err(|err| {
-                    step(
-                        &format!("upsert `{}` (batch {})", file.name, batch_index + 1),
-                        err,
-                    )
-                })?;
+    for entry in &media {
+        let metadata = match tokio::fs::metadata(&entry.path).await {
+            Ok(metadata) => metadata,
+            Err(err) => {
+                eprintln!("skipping `{}`: {err}", entry.path.display());
+                progress.files_done += 1;
+                continue;
+            }
+        };
+
+        if !existing_names.contains(entry.name.as_str()) {
+            progress.new_media += 1;
         }
 
-        tx.commit()
-            .await
-            .map_err(|err| step(&format!("commit media batch {}", batch_index + 1), err))?;
-        drop(write_guard);
+        batch.push(ScannedFile {
+            name: entry.name.clone(),
+            media_type: entry.media_type,
+            size: i64::try_from(metadata.len()).unwrap_or(i64::MAX),
+            date: metadata.modified().ok().map(DateTime::<Utc>::from),
+            sort_name: natural_sort_key(&entry.name),
+        });
+        progress.files_done += 1;
 
-        progress.files_done += batch.len() as u64;
+        if batch.len() >= INSERT_BATCH {
+            write_media_batch(state, album, &batch, batch_index).await?;
+            batch_index += 1;
+            batch.clear();
+            progress.publish(album, IndexPhase::Indexing, false, None);
+        }
+    }
+
+    if !batch.is_empty() {
+        write_media_batch(state, album, &batch, batch_index).await?;
         progress.publish(album, IndexPhase::Indexing, false, None);
     }
 
@@ -267,7 +277,6 @@ async fn sync_one(
             .await
             .map_err(|err| step("begin metadata transaction", err))?;
 
-        let observed: HashSet<&str> = scan.files.iter().map(|file| file.name.as_str()).collect();
         for (id, name) in &existing {
             if !observed.contains(name.as_str()) {
                 sqlx::query("DELETE FROM media WHERE id = ?1")
@@ -281,7 +290,7 @@ async fn sync_one(
         // Subdirectories are child albums. They are created here and indexed
         // lazily when their own info is requested, or as part of a nested job.
         let mut new_albums = 0_u64;
-        for child in &scan.dirs {
+        for child in &dirs {
             let inserted = sqlx::query(
                 "INSERT INTO albums (name, hash, sort_name, parent_id, path)
                  VALUES (?1, lower(hex(randomblob(12))), ?2, ?3, ?4)
@@ -318,11 +327,48 @@ async fn sync_one(
         (children, new_albums)
     };
 
-    progress.dirs_done += scan.dirs.len() as u64;
     progress.new_albums += new_albums;
     progress.publish(album, IndexPhase::Indexing, false, None);
 
     Ok(AlbumSyncStats { children })
+}
+
+async fn write_media_batch(
+    state: &AppState,
+    album: &Album,
+    batch: &[ScannedFile],
+    batch_index: usize,
+) -> IndexResult<()> {
+    let write_guard = state.lock_writes().await;
+    let mut tx = state
+        .db
+        .begin()
+        .await
+        .map_err(|err| step("begin media batch", err))?;
+
+    for file in batch {
+        sqlx::query(UPSERT_MEDIA)
+            .bind(&file.name)
+            .bind(file.media_type)
+            .bind(album.id)
+            .bind(file.size)
+            .bind(file.date)
+            .bind(&file.sort_name)
+            .execute(&mut *tx)
+            .await
+            .map_err(|err| {
+                step(
+                    &format!("upsert `{}` (batch {})", file.name, batch_index + 1),
+                    err,
+                )
+            })?;
+    }
+
+    tx.commit()
+        .await
+        .map_err(|err| step(&format!("commit media batch {}", batch_index + 1), err))?;
+    drop(write_guard);
+    Ok(())
 }
 
 async fn sync_tree(state: &AppState, album: &Album, progress: &mut Progress) -> IndexResult<()> {
@@ -473,12 +519,13 @@ struct ScannedDir {
     path: String,
 }
 
-struct Scan {
-    files: Vec<ScannedFile>,
-    dirs: Vec<ScannedDir>,
+struct MediaEntry {
+    name: String,
+    path: PathBuf,
+    media_type: MediaType,
 }
 
-async fn scan_dir(dir: &Path, album_path: &str) -> std::io::Result<Scan> {
+async fn read_sorted_entries(dir: &Path) -> std::io::Result<Vec<tokio::fs::DirEntry>> {
     let mut read_dir = tokio::fs::read_dir(dir).await?;
 
     let mut entries = Vec::new();
@@ -487,11 +534,20 @@ async fn scan_dir(dir: &Path, album_path: &str) -> std::io::Result<Scan> {
     }
     // Deterministic insertion order keeps row ids stable across scans.
     entries.sort_by_key(|entry| entry.file_name());
+    Ok(entries)
+}
 
-    let mut scan = Scan {
-        files: Vec::new(),
-        dirs: Vec::new(),
-    };
+/// Splits directory entries into child albums and media files.
+///
+/// Only the cached `DirEntry::file_type` is used, so this pass is cheap. The
+/// expensive per-file `metadata` call happens later, while batches are written,
+/// which keeps progress moving on large folders.
+async fn classify_entries(
+    entries: Vec<tokio::fs::DirEntry>,
+    album_path: &str,
+) -> (Vec<ScannedDir>, Vec<MediaEntry>) {
+    let mut dirs = Vec::new();
+    let mut media = Vec::new();
 
     for entry in entries {
         let path = entry.path();
@@ -506,41 +562,59 @@ async fn scan_dir(dir: &Path, album_path: &str) -> std::io::Result<Scan> {
             continue;
         }
 
-        // `metadata` follows symlinks, unlike `DirEntry::file_type`; a symlinked
-        // album directory or media file is therefore indexed normally.
-        let metadata = match tokio::fs::metadata(&path).await {
-            Ok(metadata) => metadata,
+        let file_type = match entry.file_type().await {
+            Ok(file_type) => file_type,
             Err(err) => {
                 eprintln!("skipping `{}`: {err}", path.display());
                 continue;
             }
         };
 
-        if metadata.is_dir() {
-            scan.dirs.push(ScannedDir {
+        // `file_type` does not follow symlinks, unlike `metadata`; a symlinked
+        // album directory or media file is still indexed normally.
+        let followed = if file_type.is_symlink() {
+            match tokio::fs::metadata(&path).await {
+                Ok(metadata) => Some(metadata),
+                Err(err) => {
+                    eprintln!("skipping `{}`: {err}", path.display());
+                    continue;
+                }
+            }
+        } else {
+            None
+        };
+
+        let is_dir = followed
+            .as_ref()
+            .map(std::fs::Metadata::is_dir)
+            .unwrap_or_else(|| file_type.is_dir());
+        if is_dir {
+            dirs.push(ScannedDir {
                 path: join_path(album_path, &name),
                 name,
             });
             continue;
         }
-        if !metadata.is_file() {
+
+        let is_file = followed
+            .as_ref()
+            .map(std::fs::Metadata::is_file)
+            .unwrap_or_else(|| file_type.is_file());
+        if !is_file {
             continue;
         }
 
         let Some(media_type) = media_type_for(&path) else {
             continue;
         };
-
-        scan.files.push(ScannedFile {
-            name: name.clone(),
+        media.push(MediaEntry {
+            name,
+            path,
             media_type,
-            size: i64::try_from(metadata.len()).unwrap_or(i64::MAX),
-            date: metadata.modified().ok().map(DateTime::<Utc>::from),
-            sort_name: natural_sort_key(&name),
         });
     }
 
-    Ok(scan)
+    (dirs, media)
 }
 
 fn join_path(parent: &str, name: &str) -> String {
