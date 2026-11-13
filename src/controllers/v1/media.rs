@@ -4,10 +4,10 @@ use axum::Json;
 use axum::extract::{Path, Query, State};
 use sqlx::{QueryBuilder, Sqlite};
 
-use crate::controllers::album::resolve_album;
-use crate::controllers::pagination::Pagination;
 use crate::error::AppError;
+use crate::helpers::Pagination;
 use crate::models::Media;
+use crate::resolvers::resolve_album;
 use crate::state::AppState;
 
 use super::secure::link_expiry;

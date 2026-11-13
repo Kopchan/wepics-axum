@@ -251,7 +251,7 @@ async fn sync_one(
             progress.new_media += 1;
         }
 
-        let (width, height) = image_dimensions(entry);
+        let (width, height) = image_dimensions(entry).await;
 
         batch.push(ScannedFile {
             name: entry.name.clone(),
@@ -639,30 +639,61 @@ fn join_path(parent: &str, name: &str) -> String {
 
 /// Reads image dimensions from the file header.
 ///
-/// Only still images and animated images are probed; videos and audio keep
-/// `0`, which the API treats as "unknown". A malformed or unsupported file is
-/// not an indexing error, it simply has no dimensions.
-fn image_dimensions(entry: &MediaEntry) -> (i64, i64) {
-    if !matches!(entry.media_type, MediaType::Image | MediaType::Animated) {
+/// Still and animated images use a lightweight header parser; vectors need
+/// libvips because SVG has no raster header. Videos and audio keep `0`, which
+/// the API treats as "unknown". A malformed or unsupported file is not an
+/// indexing error, it simply has no dimensions.
+async fn image_dimensions(entry: &MediaEntry) -> (i64, i64) {
+    if !matches!(
+        entry.media_type,
+        MediaType::Image | MediaType::Animated | MediaType::Vector
+    ) {
         return (0, 0);
     }
 
-    match imagesize::size(&entry.path) {
-        Ok(size) => (
-            i64::try_from(size.width).unwrap_or(i64::MAX),
-            i64::try_from(size.height).unwrap_or(i64::MAX),
+    let path = entry.path.clone();
+    let media_type = entry.media_type;
+    tokio::task::spawn_blocking(move || probe_dimensions(&path, media_type))
+        .await
+        .unwrap_or((0, 0))
+}
+
+fn probe_dimensions(path: &Path, media_type: MediaType) -> (i64, i64) {
+    let dimensions = if media_type == MediaType::Vector {
+        vips_dimensions(path)
+    } else {
+        imagesize::size(path)
+            .map(|size| (size.width, size.height))
+            .ok()
+    };
+
+    match dimensions {
+        Some((width, height)) => (
+            i64::try_from(width).unwrap_or(i64::MAX),
+            i64::try_from(height).unwrap_or(i64::MAX),
         ),
-        Err(_) => (0, 0),
+        None => (0, 0),
     }
 }
 
-fn media_type_for(path: &Path) -> Option<MediaType> {
+/// Vector dimensions through libvips. SVG is rendered lazily, so this only
+/// parses the document and reports its intrinsic size.
+fn vips_dimensions(path: &Path) -> Option<(usize, usize)> {
+    crate::helpers::vips::ensure().ok()?;
+    let image = vips::VipsImage::from_file(path).ok()?;
+    Some((image.width() as usize, image.height() as usize))
+}
+
+/// Maps a file extension to the media type stored in SQLite.
+pub fn media_type_for(path: &Path) -> Option<MediaType> {
     let extension = path.extension()?.to_str()?.to_ascii_lowercase();
 
     match extension.as_str() {
-        "jpg" | "jpeg" | "png" | "webp" | "bmp" | "tif" | "tiff" | "heic" | "heif" | "avif"
-        | "svg" => Some(MediaType::Image),
+        "jpg" | "jpeg" | "png" | "webp" | "bmp" | "tif" | "tiff" | "heic" | "heif" | "avif" => {
+            Some(MediaType::Image)
+        }
         "gif" | "apng" => Some(MediaType::Animated),
+        "svg" => Some(MediaType::Vector),
         "mp4" | "m4v" | "mkv" | "mov" | "webm" | "avi" | "mpg" | "mpeg" | "wmv" | "flv" => {
             Some(MediaType::Video)
         }
@@ -676,57 +707,4 @@ type IndexResult<T> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
 /// Adds the failing step to an error, so a bare `(code: 14)` becomes actionable.
 fn step<E: std::fmt::Display>(context: &str, error: E) -> Box<dyn std::error::Error + Send + Sync> {
     format!("{context}: {error}").into()
-}
-
-#[cfg(test)]
-mod tests {
-    use super::{media_type_for, needs_sync};
-    use crate::models::{Album, MediaType};
-    use chrono::{Duration, Utc};
-    use std::path::Path;
-
-    fn album(indexed_at: Option<chrono::DateTime<Utc>>) -> Album {
-        let now = Utc::now();
-        Album {
-            id: 1,
-            name: "album".into(),
-            hash: "hash".into(),
-            parent_id: None,
-            path: "album".into(),
-            sort_name: "album".into(),
-            indexed_at,
-            created_at: now,
-            updated_at: now,
-        }
-    }
-
-    #[test]
-    fn freshness_threshold_is_one_hour() {
-        assert!(needs_sync(&album(None)));
-        assert!(!needs_sync(&album(Some(
-            Utc::now() - Duration::minutes(30)
-        ))));
-        assert!(needs_sync(&album(Some(Utc::now() - Duration::minutes(61)))));
-    }
-
-    #[test]
-    fn classifies_media_extensions() {
-        assert_eq!(
-            media_type_for(Path::new("photo.JPG")),
-            Some(MediaType::Image)
-        );
-        assert_eq!(
-            media_type_for(Path::new("clip.mp4")),
-            Some(MediaType::Video)
-        );
-        assert_eq!(
-            media_type_for(Path::new("song.flac")),
-            Some(MediaType::Audio)
-        );
-        assert_eq!(
-            media_type_for(Path::new("anim.gif")),
-            Some(MediaType::Animated)
-        );
-        assert_eq!(media_type_for(Path::new("notes.txt")), None);
-    }
 }

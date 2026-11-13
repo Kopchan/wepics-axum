@@ -1,6 +1,4 @@
-mod album;
 mod page;
-mod pagination;
 mod system;
 pub mod v1;
 

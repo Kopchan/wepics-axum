@@ -9,17 +9,8 @@ chrono = { version = "0.4", features = ["serde"] }
 getrandom = "0.4"
 hex = "0.4"
 hmac = "0.12"
-image = { version = "0.25", default-features = false, features = [
-    "bmp",
-    "gif",
-    "jpeg",
-    "png",
-    "tiff",
-    "webp",
-] }
 vips = "0.2"
 imagesize = "0.15.0"
-kamadak-exif = "0.6.1"
 lofty = "0.25.5"
 matroska = "0.30.1"
 mp4parse = "0.17.0"
@@ -39,4 +30,9 @@ tower = { version = "0.5", features = ["util"] }
 tower-http = { version = "0.7.1", features = ["cors", "set-header", "fs"] }
 
 [dev-dependencies]
+image = { version = "0.25", default-features = false, features = [
+    "jpeg",
+    "png",
+    "webp",
+] }
 tempfile = "3"

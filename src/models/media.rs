@@ -11,6 +11,9 @@ pub enum MediaType {
     Video,
     Audio,
     Animated,
+    /// Scalable vector graphics (SVG). Kept apart from raster images because
+    /// previews and counts are produced differently.
+    Vector,
 }
 
 /// A media file that belongs to an album.
@@ -81,28 +84,4 @@ fn flush_number(digits: &mut String, width: usize, out: &mut String) {
     out.push_str(&"0".repeat(pad));
     out.push_str(significant);
     digits.clear();
-}
-
-#[cfg(test)]
-mod tests {
-    use super::natural_sort_key;
-
-    #[test]
-    fn pads_numbers_and_lowercases() {
-        assert_eq!(natural_sort_key("Img 2.JPG"), "img 0000000002.jpg");
-        assert_eq!(natural_sort_key("img0007"), "img0000000007");
-        assert_eq!(natural_sort_key("no digits"), "no digits");
-    }
-
-    #[test]
-    fn sorts_naturally() {
-        let mut names = vec!["img10.jpg", "img2.jpg", "img1.jpg", "IMG20.jpg"];
-
-        names.sort_by_key(|name| natural_sort_key(name));
-
-        assert_eq!(
-            names,
-            vec!["img1.jpg", "img2.jpg", "img10.jpg", "IMG20.jpg"]
-        );
-    }
 }

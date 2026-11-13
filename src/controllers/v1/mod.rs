@@ -2,12 +2,14 @@
 
 mod album;
 mod file;
+mod index;
 mod media;
 mod secure;
 mod thumb;
-mod types;
+pub mod types;
 
 pub use album::get_album;
 pub use file::get_file;
+pub use index::{index_events, start_index};
 pub use media::list_media;
 pub use thumb::get_thumb;
