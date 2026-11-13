@@ -9,6 +9,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         std::env::var("DATABASE_URL").unwrap_or_else(|_| "sqlite://data/wepics.db".to_string());
     let media_dir = std::env::var("MEDIA_DIR").unwrap_or_else(|_| "data/media".to_string());
 
+    let _vips = VipsInstance::new("wepics-axum", false)?;
+
     let state = AppState::connect(&database_url, media_dir).await?;
     let app = routes::app(state);
 
