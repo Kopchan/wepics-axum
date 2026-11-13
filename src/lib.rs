@@ -5,4 +5,5 @@ pub mod index_hub;
 pub mod indexer;
 pub mod models;
 pub mod routes;
+pub mod secure_link;
 pub mod state;

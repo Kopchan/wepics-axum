@@ -1,5 +1,4 @@
-pub mod api;
-pub mod files;
+pub mod v1;
 
 use axum::Router;
 use axum::extract::Request;
@@ -21,9 +20,12 @@ async fn revalidate_static(req: Request, next: Next) -> Response {
     let path = req.uri().path().to_owned();
     let mut response = next.run(req).await;
 
-    // Media (`/files`) is immutable content and API responses are dynamic;
-    // only the shell and its assets need revalidation.
-    if !(path.starts_with("/api") || path.starts_with("/files")) {
+    // Media (`/file`, `/files`, `/thumb`) is immutable content and API
+    // responses are dynamic; only the shell and its assets need revalidation.
+    if !(path.starts_with("/api")
+        || path.starts_with("/file")
+        || path.starts_with("/thumb"))
+    {
         response
             .headers_mut()
             .insert(CACHE_CONTROL, HeaderValue::from_static("no-cache"));
@@ -52,8 +54,9 @@ pub fn app(state: AppState) -> Router {
             "/public",
             ServeDir::new(&public_dir).append_index_html_on_directories(false),
         )
-        .nest("/api", api::router())
-        .nest("/files", files::router())
+        .nest("/api/v1", v1::api::router())
+        .nest("/file/v1", v1::files::router())
+        .nest("/thumb/v1", v1::thumb::router())
         .fallback_service(static_files)
         .layer(cors::layer())
         .layer(middleware::from_fn(revalidate_static))

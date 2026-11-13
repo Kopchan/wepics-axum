@@ -8,6 +8,8 @@ use serde_json::json;
 pub enum AppError {
     NotFound,
     BadRequest(String),
+    Forbidden(String),
+    Internal(String),
     Database(sqlx::Error),
     Io(std::io::Error),
 }
@@ -17,6 +19,8 @@ impl std::fmt::Display for AppError {
         match self {
             AppError::NotFound => write!(f, "not found"),
             AppError::BadRequest(message) => write!(f, "bad request: {message}"),
+            AppError::Forbidden(message) => write!(f, "forbidden: {message}"),
+            AppError::Internal(message) => write!(f, "internal error: {message}"),
             AppError::Database(err) => write!(f, "database error: {err}"),
             AppError::Io(err) => write!(f, "io error: {err}"),
         }
@@ -26,7 +30,10 @@ impl std::fmt::Display for AppError {
 impl std::error::Error for AppError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
-            AppError::NotFound | AppError::BadRequest(_) => None,
+            AppError::NotFound
+            | AppError::BadRequest(_)
+            | AppError::Forbidden(_)
+            | AppError::Internal(_) => None,
             AppError::Database(err) => Some(err),
             AppError::Io(err) => Some(err),
         }
@@ -57,6 +64,14 @@ impl IntoResponse for AppError {
         let (status, message) = match self {
             AppError::NotFound => (StatusCode::NOT_FOUND, "not found".to_string()),
             AppError::BadRequest(message) => (StatusCode::BAD_REQUEST, message),
+            AppError::Forbidden(message) => (StatusCode::FORBIDDEN, message),
+            AppError::Internal(message) => {
+                eprintln!("internal error: {message}");
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "internal server error".to_string(),
+                )
+            }
             // Internal details stay in logs, not in the response.
             AppError::Database(err) => {
                 eprintln!("database error: {err}");

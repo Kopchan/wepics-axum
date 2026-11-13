@@ -1072,11 +1072,31 @@ async fn static_frontend_files_are_served() {
     let (dir, state) = setup().await;
     let app = app(state);
 
+    // Vite emits content-hashed asset names, so discover them from the built
+    // entry point instead of hardcoding names that change on every build.
+    let index = std::fs::read_to_string("public/index.html").expect("built frontend is embedded");
+    let asset_path = |marker: &str| -> String {
+        let start = index
+            .find(marker)
+            .unwrap_or_else(|| panic!("index.html has no {marker:?}"));
+        let rest = &index[start..];
+        let value = rest
+            .find("=\"./")
+            .unwrap_or_else(|| panic!("index.html has no URL after {marker:?}"));
+        let rest = &rest[value + 4..];
+        let end = rest.find('"').expect("unterminated asset reference");
+        format!("/public/{}", &rest[..end])
+    };
+    let js_path = asset_path("<script type=\"module\"");
+    let css_path = asset_path("rel=\"stylesheet\"");
+    let manifest_path = asset_path("rel=\"manifest\"");
+
     for (path, needle, content_type) in [
-        ("/public/app.js", "load-more", "javascript"),
-        ("/public/style.css", "--accent", "css"),
-        ("/public/favicon.svg", "<svg", "svg"),
-        ("/public/favicon.ico", "", "icon"),
+        (js_path.as_str(), "mediaHash", "javascript"),
+        (css_path.as_str(), "--accent", "css"),
+        (manifest_path.as_str(), "\"wepics\"", "json"),
+        ("/public/icon/circle.svg", "<svg", "svg"),
+        ("/public/icon/circle16.png", "", "image/png"),
     ] {
         let (status, headers, body) = send(&app, path).await;
         assert_eq!(status, StatusCode::OK, "path: {path}");
@@ -1290,4 +1310,366 @@ async fn symlinked_album_directory_is_indexed() {
     std::fs::remove_file(&link).ok();
 
     drop(dir);
+}
+
+fn parse_v1(body: &[u8]) -> serde_json::Value {
+    serde_json::from_slice(body)
+        .unwrap_or_else(|err| panic!("invalid v1 json ({err}): {}", String::from_utf8_lossy(body)))
+}
+
+fn v1_names(value: &serde_json::Value, key: &str) -> Vec<String> {
+    value[key]
+        .as_array()
+        .unwrap_or_else(|| panic!("`{key}` is not an array: {value}"))
+        .iter()
+        .map(|item| item["name"].as_str().unwrap().to_string())
+        .collect()
+}
+
+#[tokio::test]
+async fn v1_album_returns_stats_previews_and_signed_links() {
+    let (_dir, state) = setup().await;
+    let root_id = root_album_id(&state).await;
+
+    for index in 1..=6 {
+        insert_media(
+            &state.db,
+            root_id,
+            NewMedia {
+                name: &format!("photo{index}.jpg"),
+                hash: &format!("m{index}"),
+                date: Some(at(index)),
+                size: i64::from(index) * 10,
+            },
+        )
+        .await;
+    }
+
+    let app = app(state.clone());
+    let (status, _, body) = send(&app, "/api/v1/albums/root").await;
+    assert_eq!(status, StatusCode::OK);
+
+    let album = parse_v1(&body);
+    assert_eq!(album["hash"], "root");
+    assert_eq!(album["mediasCount"], 6);
+    assert_eq!(album["imagesCount"], 6);
+    assert_eq!(album["videosCount"], 0);
+    assert_eq!(album["albumsCount"], 0);
+    assert!(
+        album.get("sync").is_none(),
+        "fresh albums have no sync state"
+    );
+
+    // Four previews by default, naturally sorted by name.
+    let images = album["images"].as_array().unwrap();
+    assert_eq!(images.len(), 4);
+    assert_eq!(
+        v1_names(&album, "images"),
+        vec!["photo1.jpg", "photo2.jpg", "photo3.jpg", "photo4.jpg"]
+    );
+
+    for image in images {
+        assert_eq!(image["type"], "image");
+        assert_eq!(image["width"], 800);
+        assert_eq!(image["height"], 600);
+        assert_eq!(image["album"]["hash"], "root");
+        assert_eq!(image["album"]["name"], "root");
+
+        let media_hash = image["mediaHash"].as_str().unwrap();
+        let token = image["hash"].as_str().unwrap();
+        let exp = image["exp"].as_i64().unwrap();
+        assert!(
+            state.verify_media("root", media_hash, token, exp),
+            "previews carry a valid secure link"
+        );
+        assert!(exp > Utc::now().timestamp());
+    }
+
+    // `mlimit=0` disables previews entirely.
+    let (status, _, body) = send(&app, "/api/v1/albums/root?mlimit=0").await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(parse_v1(&body).get("images").is_none());
+
+    // A reverse-prefixed sort array is honoured.
+    let (status, _, body) = send(&app, "/api/v1/albums/root?msort=-size&mlimit=2").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        v1_names(&parse_v1(&body), "images"),
+        vec!["photo6.jpg", "photo5.jpg"]
+    );
+
+    // Type filtering reaches the preview query too.
+    let (status, _, body) = send(&app, "/api/v1/albums/root?mtype=vid").await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(parse_v1(&body)["images"].as_array().unwrap().is_empty());
+
+    let (status, _, _) = send(&app, "/api/v1/albums/root?mtype=bogus").await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn v1_album_layers_children_sorting_and_ancestors() {
+    let (_dir, state) = setup().await;
+    let root_id = root_album_id(&state).await;
+
+    let bravo = insert_child(&state.db, root_id, "Bravo", at(2)).await;
+    let alpha = insert_child(&state.db, root_id, "Alpha", at(1)).await;
+    let grand = insert_child(&state.db, alpha.id, "Grand", at(1)).await;
+
+    for (album_id, prefix) in [
+        (root_id, "root"),
+        (bravo.id, "bravo"),
+        (alpha.id, "alpha"),
+        (grand.id, "grand"),
+    ] {
+        for index in 1..=3 {
+            insert_media(
+                &state.db,
+                album_id,
+                NewMedia {
+                    name: &format!("{prefix}{index}.jpg"),
+                    hash: &format!("{prefix}-m{index}"),
+                    date: Some(at(index)),
+                    size: 10,
+                },
+            )
+            .await;
+        }
+    }
+
+    let app = app(state.clone());
+
+    // Default: one layer of children, four previews everywhere.
+    let (status, _, body) = send(&app, "/api/v1/albums/root").await;
+    assert_eq!(status, StatusCode::OK);
+    let album = parse_v1(&body);
+    assert_eq!(v1_names(&album, "children"), vec!["Alpha", "Bravo"]);
+    assert_eq!(album["children"][0]["images"].as_array().unwrap().len(), 3);
+    assert!(
+        album["children"][0].get("children").is_none(),
+        "grandchildren need `layers=2`"
+    );
+
+    // `asort` reverses child order.
+    let (status, _, body) = send(&app, "/api/v1/albums/root?asort=-name").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        v1_names(&parse_v1(&body), "children"),
+        vec!["Bravo", "Alpha"]
+    );
+
+    // `layers=0` returns only the requested album.
+    let (status, _, body) = send(&app, "/api/v1/albums/root?layers=0").await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(parse_v1(&body).get("children").is_none());
+
+    // `layers=2` adds grandchildren; `mlimitnest` limits their previews.
+    let (status, _, body) = send(&app, "/api/v1/albums/root?layers=2&mlimitnest=1&mlimit=2").await;
+    assert_eq!(status, StatusCode::OK);
+    let album = parse_v1(&body);
+    assert_eq!(album["images"].as_array().unwrap().len(), 2);
+    let alpha = &album["children"][0];
+    assert_eq!(alpha["name"], "Alpha");
+    assert_eq!(alpha["images"].as_array().unwrap().len(), 1);
+    let grand_preview = &alpha["children"][0];
+    assert_eq!(grand_preview["name"], "Grand");
+    assert_eq!(grand_preview["images"].as_array().unwrap().len(), 1);
+
+    // Ancestors are root-first.
+    let (status, _, body) = send(&app, &format!("/api/v1/albums/{}", grand.hash)).await;
+    assert_eq!(status, StatusCode::OK);
+    let album = parse_v1(&body);
+    assert_eq!(
+        v1_names(&album, "ancestors"),
+        vec!["root", "Alpha"],
+        "ancestors must be ordered from root down"
+    );
+}
+
+#[tokio::test]
+async fn v1_media_paginates_sorts_and_filters() {
+    let (_dir, state) = setup().await;
+    let root_id = root_album_id(&state).await;
+
+    for index in 1..=5 {
+        insert_media(
+            &state.db,
+            root_id,
+            NewMedia {
+                name: &format!("photo{index}.jpg"),
+                hash: &format!("m{index}"),
+                date: Some(at(index)),
+                size: i64::from(index) * 10,
+            },
+        )
+        .await;
+    }
+    sqlx::query(
+        r#"INSERT INTO media (name, hash, "type", album_id, width, height, date, size, sort_name)
+           VALUES ('clip.mp4', 'v1', 'video', ?1, 0, 0, NULL, 100, ?2)"#,
+    )
+    .bind(root_id)
+    .bind(natural_sort_key("clip.mp4"))
+    .execute(&state.db)
+    .await
+    .unwrap();
+
+    let app = app(state.clone());
+
+    let (status, _, body) = send(
+        &app,
+        "/api/v1/album/root/media?limit=2&page=2&sort=date&type=img",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let page = parse_v1(&body);
+    assert_eq!(page["page"], 2);
+    assert_eq!(page["per_page"], 2);
+    assert_eq!(page["total"], 5);
+    assert_eq!(page["pages"], 3);
+    assert_eq!(
+        v1_names(&page, "pictures"),
+        vec!["photo3.jpg", "photo4.jpg"]
+    );
+
+    let (status, _, body) = send(&app, "/api/v1/album/root/media?sort=-size").await;
+    assert_eq!(status, StatusCode::OK);
+    let page = parse_v1(&body);
+    assert_eq!(
+        v1_names(&page, "pictures"),
+        vec![
+            "clip.mp4",
+            "photo5.jpg",
+            "photo4.jpg",
+            "photo3.jpg",
+            "photo2.jpg",
+            "photo1.jpg"
+        ]
+    );
+
+    let picture = &page["pictures"][0];
+    let media_hash = picture["mediaHash"].as_str().unwrap();
+    let token = picture["hash"].as_str().unwrap();
+    let exp = picture["exp"].as_i64().unwrap();
+    assert!(state.verify_media("root", media_hash, token, exp));
+
+    let (status, _, _) = send(&app, "/api/v1/album/root/media?type=bogus").await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+
+    let (status, _, _) = send(&app, "/api/v1/album/missing/media").await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn v1_preview_and_original_require_a_valid_signature() {
+    let (_dir, state) = setup().await;
+    let root_id = root_album_id(&state).await;
+
+    let source = state.media_dir.join("photo.png");
+    image::RgbImage::from_pixel(800, 600, image::Rgb([10, 20, 30]))
+        .save(&source)
+        .unwrap();
+    let original = std::fs::read(&source).unwrap();
+
+    insert_media(
+        &state.db,
+        root_id,
+        NewMedia {
+            name: "photo.png",
+            hash: "media1",
+            date: Some(at(1)),
+            size: original.len() as i64,
+        },
+    )
+    .await;
+
+    let app = app(state.clone());
+    let exp = Utc::now().timestamp() + 3600;
+    let token = state.sign_media("root", "media1", exp);
+    let link = format!("hash={token}&exp={exp}");
+
+    // Preview: 800x600 scaled down to width 144 -> 108 px high, WebP encoded.
+    let (status, headers, body) = send(&app, &format!("/thumb/v1/root/media1/w144?{link}")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(headers[header::CONTENT_TYPE], "image/webp");
+    assert_eq!(&body[..4], b"RIFF");
+    assert_eq!(&body[8..12], b"WEBP");
+    let preview = image::load_from_memory(&body).unwrap();
+    assert_eq!((preview.width(), preview.height()), (144, 108));
+    assert!(
+        state.thumb_dir().join("w144").join("media1.webp").is_file(),
+        "generated previews are cached"
+    );
+
+    // Original: exact bytes, inline disposition and the Laravel cache policy.
+    let (status, headers, body) = send(&app, &format!("/file/v1/root/media1?{link}")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body, original);
+    assert!(
+        headers[header::CONTENT_DISPOSITION]
+            .to_str()
+            .unwrap()
+            .starts_with("inline"),
+    );
+    assert_eq!(
+        headers[header::CACHE_CONTROL],
+        "public, max-age=3600, immutable"
+    );
+
+    // Missing, tampered and expired signatures are rejected.
+    let (status, _, _) = send(&app, "/thumb/v1/root/media1/w144").await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+
+    let (status, _, _) = send(&app, &format!("/file/v1/root/media1?hash=bad&exp={exp}")).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+
+    let expired_at = Utc::now().timestamp() - 10;
+    let expired = state.sign_media("root", "media1", expired_at);
+    let (status, _, _) = send(
+        &app,
+        &format!("/file/v1/root/media1?hash={expired}&exp={expired_at}"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+
+    // A token for another media hash does not unlock this file.
+    let other = state.sign_media("root", "other", exp);
+    let (status, _, _) = send(
+        &app,
+        &format!("/file/v1/root/media1?hash={other}&exp={exp}"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
+async fn v1_indexing_stores_image_dimensions() {
+    let (_dir, state) = setup().await;
+    let root_id = root_album_id(&state).await;
+
+    image::RgbImage::from_pixel(40, 20, image::Rgb([1, 2, 3]))
+        .save(state.media_dir.join("tiny.png"))
+        .unwrap();
+
+    set_indexed_at(&state, root_id, None).await;
+    let app = app(state.clone());
+    let since = Utc::now() - chrono::Duration::seconds(1);
+    let (status, _, _) = send(&app, "/api/albums/root/index?force").await;
+    assert_eq!(status, StatusCode::OK);
+    wait_for_indexed(&state, root_id, since).await;
+
+    let (width, height): (i64, i64) =
+        sqlx::query_as("SELECT width, height FROM media WHERE album_id = ?1")
+            .bind(root_id)
+            .fetch_one(&state.db)
+            .await
+            .unwrap();
+    assert_eq!((width, height), (40, 20));
+
+    let (status, _, body) = send(&app, "/api/v1/albums/root").await;
+    assert_eq!(status, StatusCode::OK);
+    let album = parse_v1(&body);
+    assert_eq!(album["images"][0]["name"], "tiny.png");
+    assert_eq!(album["images"][0]["width"], 40);
+    assert_eq!(album["images"][0]["height"], 20);
 }

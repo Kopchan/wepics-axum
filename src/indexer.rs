@@ -23,14 +23,18 @@ const INSERT_BATCH: usize = 100;
 const STALE_AFTER_HOURS: i64 = 1;
 
 const UPSERT_MEDIA: &str = r#"
-INSERT INTO media (name, hash, "type", album_id, size, date, sort_name)
-VALUES (?1, lower(hex(randomblob(12))), ?2, ?3, ?4, ?5, ?6)
+INSERT INTO media (name, hash, "type", album_id, width, height, size, date, sort_name)
+VALUES (?1, lower(hex(randomblob(12))), ?2, ?3, ?4, ?5, ?6, ?7, ?8)
 ON CONFLICT(album_id, name) DO UPDATE SET
     "type" = excluded."type",
+    width = excluded.width,
+    height = excluded.height,
     size = excluded.size,
     date = excluded.date,
     sort_name = excluded.sort_name
 WHERE media."type" <> excluded."type"
+   OR media.width <> excluded.width
+   OR media.height <> excluded.height
    OR media.size <> excluded.size
    OR media.date IS NOT excluded.date
    OR media.sort_name <> excluded.sort_name
@@ -247,9 +251,13 @@ async fn sync_one(
             progress.new_media += 1;
         }
 
+        let (width, height) = image_dimensions(entry);
+
         batch.push(ScannedFile {
             name: entry.name.clone(),
             media_type: entry.media_type,
+            width,
+            height,
             size: i64::try_from(metadata.len()).unwrap_or(i64::MAX),
             date: metadata.modified().ok().map(DateTime::<Utc>::from),
             sort_name: natural_sort_key(&entry.name),
@@ -351,6 +359,8 @@ async fn write_media_batch(
             .bind(&file.name)
             .bind(file.media_type)
             .bind(album.id)
+            .bind(file.width)
+            .bind(file.height)
             .bind(file.size)
             .bind(file.date)
             .bind(&file.sort_name)
@@ -509,6 +519,8 @@ async fn count_tree(dir: &Path) -> std::io::Result<(u64, u64)> {
 struct ScannedFile {
     name: String,
     media_type: MediaType,
+    width: i64,
+    height: i64,
     size: i64,
     date: Option<DateTime<Utc>>,
     sort_name: String,
@@ -622,6 +634,25 @@ fn join_path(parent: &str, name: &str) -> String {
         name.to_owned()
     } else {
         format!("{parent}/{name}")
+    }
+}
+
+/// Reads image dimensions from the file header.
+///
+/// Only still images and animated images are probed; videos and audio keep
+/// `0`, which the API treats as "unknown". A malformed or unsupported file is
+/// not an indexing error, it simply has no dimensions.
+fn image_dimensions(entry: &MediaEntry) -> (i64, i64) {
+    if !matches!(entry.media_type, MediaType::Image | MediaType::Animated) {
+        return (0, 0);
+    }
+
+    match imagesize::size(&entry.path) {
+        Ok(size) => (
+            i64::try_from(size.width).unwrap_or(i64::MAX),
+            i64::try_from(size.height).unwrap_or(i64::MAX),
+        ),
+        Err(_) => (0, 0),
     }
 }
 

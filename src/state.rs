@@ -16,6 +16,8 @@ pub struct AppState {
     pub db: SqlitePool,
     /// Storage root, `./data/media` by default.
     pub media_dir: PathBuf,
+    /// Per-process secret for media link signatures.
+    secret: Arc<[u8; 32]>,
     /// Albums with a background indexing task in flight.
     syncing: SyncTracker,
     /// Serializes indexing transactions: SQLite has one writer at a time.
@@ -29,6 +31,7 @@ impl AppState {
         Self {
             db,
             media_dir: media_dir.into(),
+            secret: Arc::new(random_secret()),
             syncing: SyncTracker::default(),
             write_gate: Arc::new(tokio::sync::Mutex::new(())),
             index_hub: IndexHub::default(),
@@ -76,6 +79,9 @@ impl AppState {
     /// album row exist. Requests never create them.
     pub async fn initialize(&self) -> Result<(), Box<dyn std::error::Error>> {
         tokio::fs::create_dir_all(&self.media_dir).await?;
+        // Hidden directory: the indexer skips names starting with a dot, so
+        // generated thumbnails never become albums or media.
+        tokio::fs::create_dir_all(self.thumb_dir()).await?;
 
         // `OR IGNORE` makes restarts idempotent.
         sqlx::query("INSERT OR IGNORE INTO albums (name, hash, sort_name) VALUES (?1, ?1, ?2)")
@@ -85,6 +91,29 @@ impl AppState {
             .await?;
 
         Ok(())
+    }
+
+    /// Root directory for generated previews, inside the media root but hidden
+    /// from indexing.
+    pub fn thumb_dir(&self) -> PathBuf {
+        self.media_dir.join(".thumbs").join("v1")
+    }
+
+    /// Short-lived signature for `/thumb/v1` and `/file/v1`.
+    pub fn sign_media(&self, album_hash: &str, media_hash: &str, exp: i64) -> String {
+        crate::secure_link::token(self.secret.as_ref(), album_hash, media_hash, exp)
+    }
+
+    /// Validates a media link signature and its expiry.
+    pub fn verify_media(&self, album_hash: &str, media_hash: &str, token: &str, exp: i64) -> bool {
+        crate::secure_link::verify(
+            self.secret.as_ref(),
+            album_hash,
+            media_hash,
+            token,
+            exp,
+            chrono::Utc::now().timestamp(),
+        )
     }
 
     /// Directory that holds an album's files, relative to the storage root.
@@ -134,6 +163,26 @@ impl AppState {
 
 pub(crate) fn is_safe_segment(segment: &str) -> bool {
     !segment.is_empty() && segment != "." && segment != ".." && !segment.contains(['/', '\\', '\0'])
+}
+
+/// Salt for link signatures. Falls back to a process-unique value if the OS
+/// random source is unavailable, which keeps the server usable and still makes
+/// links invalid after a restart.
+fn random_secret() -> [u8; 32] {
+    let mut secret = [0_u8; 32];
+    if getrandom::fill(&mut secret).is_ok() {
+        return secret;
+    }
+
+    use sha2::{Digest, Sha256};
+
+    let mut hasher = Sha256::new();
+    if let Ok(now) = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
+        hasher.update(now.as_nanos().to_le_bytes());
+    }
+    hasher.update(std::process::id().to_le_bytes());
+    secret.copy_from_slice(&hasher.finalize());
+    secret
 }
 
 /// In-memory set of albums with an indexing task in flight.
