@@ -22,10 +22,7 @@ async fn revalidate_static(req: Request, next: Next) -> Response {
 
     // Media (`/file`, `/files`, `/thumb`) is immutable content and API
     // responses are dynamic; only the shell and its assets need revalidation.
-    if !(path.starts_with("/api")
-        || path.starts_with("/file")
-        || path.starts_with("/thumb"))
-    {
+    if !(path.starts_with("/api") || path.starts_with("/file") || path.starts_with("/thumb")) {
         response
             .headers_mut()
             .insert(CACHE_CONTROL, HeaderValue::from_static("no-cache"));

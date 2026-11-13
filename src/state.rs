@@ -16,6 +16,9 @@ pub struct AppState {
     pub db: SqlitePool,
     /// Storage root, `./data/media` by default.
     pub media_dir: PathBuf,
+    /// Generated artifacts, `./data/cache` by default. Kept outside the media
+    /// tree so previews can never be indexed as albums or media.
+    pub cache_dir: PathBuf,
     /// Per-process secret for media link signatures.
     secret: Arc<[u8; 32]>,
     /// Albums with a background indexing task in flight.
@@ -27,10 +30,15 @@ pub struct AppState {
 }
 
 impl AppState {
-    pub fn new(db: SqlitePool, media_dir: impl Into<PathBuf>) -> Self {
+    pub fn new(
+        db: SqlitePool,
+        media_dir: impl Into<PathBuf>,
+        cache_dir: impl Into<PathBuf>,
+    ) -> Self {
         Self {
             db,
             media_dir: media_dir.into(),
+            cache_dir: cache_dir.into(),
             secret: Arc::new(random_secret()),
             syncing: SyncTracker::default(),
             write_gate: Arc::new(tokio::sync::Mutex::new(())),
@@ -43,6 +51,7 @@ impl AppState {
     pub async fn connect(
         database_url: &str,
         media_dir: impl Into<PathBuf>,
+        cache_dir: impl Into<PathBuf>,
     ) -> Result<Self, Box<dyn std::error::Error>> {
         let options = SqliteConnectOptions::from_str(database_url)?
             .create_if_missing(true)
@@ -70,7 +79,7 @@ impl AppState {
 
         sqlx::migrate!("./migrations").run(&db).await?;
 
-        let state = Self::new(db, media_dir);
+        let state = Self::new(db, media_dir, cache_dir);
         state.initialize().await?;
         Ok(state)
     }
@@ -79,8 +88,8 @@ impl AppState {
     /// album row exist. Requests never create them.
     pub async fn initialize(&self) -> Result<(), Box<dyn std::error::Error>> {
         tokio::fs::create_dir_all(&self.media_dir).await?;
-        // Hidden directory: the indexer skips names starting with a dot, so
-        // generated thumbnails never become albums or media.
+        // Previews live in the cache root, never inside the media tree, so the
+        // indexer cannot mistake them for albums or media.
         tokio::fs::create_dir_all(self.thumb_dir()).await?;
 
         // `OR IGNORE` makes restarts idempotent.
@@ -93,10 +102,9 @@ impl AppState {
         Ok(())
     }
 
-    /// Root directory for generated previews, inside the media root but hidden
-    /// from indexing.
+    /// Root directory for generated previews.
     pub fn thumb_dir(&self) -> PathBuf {
-        self.media_dir.join(".thumbs").join("v1")
+        self.cache_dir.join("thumbs").join("v1")
     }
 
     /// Short-lived signature for `/thumb/v1` and `/file/v1`.

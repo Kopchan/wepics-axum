@@ -8,9 +8,9 @@ use axum::http::header::{CACHE_CONTROL, CONTENT_TYPE, HOST, USER_AGENT};
 use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use axum::response::Response;
 
-use crate::controllers::album::resolve_album;
 use crate::error::AppError;
 use crate::models::{Album, ROOT_ALBUM_HASH};
+use crate::resolvers::resolve_album;
 use crate::state::AppState;
 
 const SITE_NAME: &str = "wepics";
@@ -45,8 +45,12 @@ pub async fn root_page(
 pub async fn spa(State(state): State<AppState>, request: Request) -> Result<Response, AppError> {
     let path = request.uri().path().to_owned();
 
-    // API/file/static paths must stay 404s instead of turning into HTML.
-    if path.starts_with("/api") || path.starts_with("/files") || path.starts_with("/public") {
+    // API/media/static paths must stay 404s instead of turning into HTML.
+    if path.starts_with("/api")
+        || path.starts_with("/file")
+        || path.starts_with("/thumb")
+        || path.starts_with("/public")
+    {
         return Err(AppError::NotFound);
     }
 
@@ -83,7 +87,7 @@ async fn render_bot_page(
 
     let image: Option<(String, i64, i64)> = sqlx::query_as(
         "SELECT hash, width, height FROM media \
-         WHERE album_id = ?1 AND \"type\" IN ('image', 'animated') \
+         WHERE album_id = ?1 AND \"type\" IN ('image', 'vector', 'animated') \
          ORDER BY date IS NULL, date, id LIMIT 1",
     )
     .bind(album.id)
@@ -113,14 +117,18 @@ async fn render_bot_page(
     };
     let url = format!("{base}{canonical_path}");
 
-    let image = image.map(|(hash, width, height)| OgImage {
-        url: format!(
-            "{base}/files/{}/{}",
-            encode_segment(&album.hash),
-            encode_segment(&hash)
-        ),
-        width,
-        height,
+    let image = image.map(|(hash, width, height)| {
+        let exp = crate::secure_link::expires_at(chrono::Utc::now().timestamp());
+        let token = state.sign_media(&album.hash, &hash, exp);
+        OgImage {
+            url: format!(
+                "{base}/file/v1/{}/{}?hash={token}&exp={exp}",
+                encode_segment(&album.hash),
+                encode_segment(&hash)
+            ),
+            width,
+            height,
+        }
     });
 
     let meta = social_meta(&title, &description, &url, image.as_ref(), &album.name);

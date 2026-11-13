@@ -1,20 +1,20 @@
 use crate::error::AppError;
 
 /// Default page size for list endpoints.
-pub(crate) const DEFAULT_LIMIT: u32 = 30;
+pub const DEFAULT_LIMIT: u32 = 30;
 /// Upper bound accepted for `?limit=`.
-pub(crate) const MAX_LIMIT: u32 = 100;
+pub const MAX_LIMIT: u32 = 100;
 
 /// Validated `?page=&limit=` pair, shared by every list endpoint.
 #[derive(Debug, Clone, Copy)]
-pub(crate) struct Pagination {
+pub struct Pagination {
     pub page: u32,
     pub limit: u32,
     pub offset: i64,
 }
 
 impl Pagination {
-    pub(crate) fn new(page: Option<u32>, limit: Option<u32>) -> Result<Self, AppError> {
+    pub fn new(page: Option<u32>, limit: Option<u32>) -> Result<Self, AppError> {
         let page = page.unwrap_or(1);
         let limit = limit.unwrap_or(DEFAULT_LIMIT);
 
@@ -35,7 +35,7 @@ impl Pagination {
     }
 
     /// Total number of pages, rounded up; `0` for an empty result set.
-    pub(crate) fn pages(self, total: i64) -> i64 {
+    pub fn pages(self, total: i64) -> i64 {
         (total + i64::from(self.limit) - 1) / i64::from(self.limit)
     }
 }

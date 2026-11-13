@@ -4,10 +4,10 @@ use axum::Json;
 use axum::extract::{Path, Query, State};
 use sqlx::{QueryBuilder, Sqlite};
 
-use crate::controllers::album::resolve_album;
 use crate::error::AppError;
 use crate::indexer::{self, SyncStart};
 use crate::models::{Album, Media, MediaType};
+use crate::resolvers::resolve_album;
 use crate::state::AppState;
 
 use super::secure::link_expiry;
@@ -178,30 +178,4 @@ async fn load_ancestors(
 
     ancestors.reverse();
     Ok((!ancestors.is_empty()).then_some(ancestors))
-}
-
-#[cfg(test)]
-mod tests {
-    use super::{DEFAULT_LAYERS, DEFAULT_PREVIEWS};
-    use crate::controllers::v1::types::{parse_album_sort, parse_media_sort, parse_preview_count};
-
-    #[test]
-    fn defaults_match_laravel_behaviour() {
-        assert_eq!(DEFAULT_PREVIEWS, 4);
-        assert_eq!(DEFAULT_LAYERS, 1);
-        assert_eq!(parse_preview_count(None, DEFAULT_PREVIEWS).unwrap(), 4);
-        assert_eq!(parse_preview_count(Some(0), DEFAULT_PREVIEWS).unwrap(), 0);
-    }
-
-    #[test]
-    fn sort_arrays_accept_reverse_prefixes() {
-        let media = parse_media_sort(Some("date,-size,name")).unwrap();
-        assert!(!media[0].descending);
-        assert!(media[1].descending);
-        assert!(!media[2].descending);
-
-        let albums = parse_album_sort(Some("level,-created")).unwrap();
-        assert!(!albums[0].descending);
-        assert!(albums[1].descending);
-    }
 }

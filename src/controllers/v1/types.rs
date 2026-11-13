@@ -13,11 +13,6 @@ use crate::state::AppState;
 pub const MEDIA_SELECT: &str = "SELECT id, name, hash, \"type\", album_id, width, height, \
      duration_sec, date, size, sort_name, created_at, updated_at FROM media";
 
-/// Single media row by album and media hash.
-pub const MEDIA_BY_HASH: &str = "SELECT id, name, hash, \"type\", album_id, width, height, \
-     duration_sec, date, size, sort_name, created_at, updated_at FROM media \
-     WHERE album_id = ?1 AND hash = ?2";
-
 /// `GET /api/v1/albums/{hash}` parameters.
 #[derive(Debug, Deserialize)]
 pub struct AlbumQuery {
@@ -222,6 +217,7 @@ pub fn media_type_name(media_type: MediaType) -> &'static str {
         MediaType::Video => "video",
         MediaType::Audio => "audio",
         MediaType::Animated => "imageAnimated",
+        MediaType::Vector => "imageVector",
     }
 }
 
@@ -232,6 +228,7 @@ pub fn media_type_db(media_type: MediaType) -> &'static str {
         MediaType::Video => "video",
         MediaType::Audio => "audio",
         MediaType::Animated => "animated",
+        MediaType::Vector => "vector",
     }
 }
 
@@ -252,9 +249,10 @@ pub fn parse_media_types(raw: Option<&str>) -> Result<Vec<MediaType>, AppError> 
             "vid" | "video" => MediaType::Video,
             "aud" | "audio" => MediaType::Audio,
             "anim" | "animated" | "imageanimated" => MediaType::Animated,
+            "vec" | "vector" | "svg" | "imagevector" => MediaType::Vector,
             other => {
                 return Err(AppError::BadRequest(format!(
-                    "invalid media type `{other}`, expected img, vid, aud or anim"
+                    "invalid media type `{other}`, expected img, vid, aud, anim or vec"
                 )));
             }
         };
@@ -398,7 +396,7 @@ pub async fn load_album_stats(pool: &SqlitePool, album_id: i64) -> Result<AlbumS
     let row: Row = sqlx::query_as(
         "SELECT
             (SELECT COUNT(*) FROM media WHERE album_id = ?1) AS medias_count,
-            (SELECT COUNT(*) FROM media WHERE album_id = ?1 AND \"type\" = 'image') AS images_count,
+            (SELECT COUNT(*) FROM media WHERE album_id = ?1 AND \"type\" IN ('image', 'vector')) AS images_count,
             (SELECT COUNT(*) FROM media WHERE album_id = ?1 AND \"type\" IN ('video', 'animated')) AS videos_count,
             (SELECT COUNT(*) FROM media WHERE album_id = ?1 AND \"type\" = 'audio') AS audios_count,
             (SELECT COUNT(*) FROM albums WHERE parent_id = ?1) AS albums_count,
@@ -537,7 +535,8 @@ pub fn push_album_order(builder: &mut QueryBuilder<Sqlite>, sorts: &[AlbumSort])
             AlbumSortField::Images => {
                 builder
                     .push(
-                        "(SELECT COUNT(*) FROM media WHERE album_id = albums.id AND \"type\" = 'image')",
+                        "(SELECT COUNT(*) FROM media WHERE album_id = albums.id \
+                         AND \"type\" IN ('image', 'vector'))",
                     )
                     .push(direction);
             }

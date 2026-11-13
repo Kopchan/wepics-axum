@@ -11,13 +11,12 @@ use tower::{Layer, ServiceExt};
 use tower_http::services::ServeFile;
 use tower_http::set_header::SetResponseHeaderLayer;
 
-use crate::controllers::album::resolve_album;
 use crate::error::AppError;
-use crate::models::Media;
+use crate::resolvers::{resolve_album, resolve_media};
 use crate::state::AppState;
 
 use super::secure::verify_link;
-use super::types::{LinkQuery, MEDIA_BY_HASH};
+use super::types::LinkQuery;
 
 const CACHE_CONTROL_VALUE: &str = "public, max-age=3600, immutable";
 
@@ -32,12 +31,7 @@ pub async fn get_file(
     verify_link(&state, &album_hash, &media_hash, &query)?;
 
     let album = resolve_album(&state, &album_hash).await?;
-    let media: Media = sqlx::query_as(MEDIA_BY_HASH)
-        .bind(album.id)
-        .bind(&media_hash)
-        .fetch_optional(&state.db)
-        .await?
-        .ok_or(AppError::NotFound)?;
+    let media = resolve_media(&state, &album, &media_hash).await?;
 
     let path = state.media_path(&album, &media).ok_or(AppError::NotFound)?;
     if !tokio::fs::metadata(&path).await?.is_file() {
