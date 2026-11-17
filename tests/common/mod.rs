@@ -121,7 +121,7 @@ pub async fn insert_album(pool: &SqlitePool, name: &str, hash: &str) -> Album {
     sqlx::query_as(
         "INSERT INTO albums (name, hash, sort_name, path, indexed_at)
          VALUES (?1, ?2, ?3, ?2, ?4)
-         RETURNING id, name, hash, parent_id, path, indexed_at, sort_name, created_at, updated_at",
+         RETURNING id, name, hash, parent_id, path, alias, old_aliases, rating_level, order_level, guest_allow, indexed_at, sort_name, created_at, updated_at",
     )
     .bind(name)
     .bind(hash)
@@ -141,7 +141,7 @@ pub async fn insert_child(
     sqlx::query_as(
         "INSERT INTO albums (name, hash, sort_name, parent_id, path, created_at, indexed_at)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
-         RETURNING id, name, hash, parent_id, path, indexed_at, sort_name, created_at, updated_at",
+         RETURNING id, name, hash, parent_id, path, alias, old_aliases, rating_level, order_level, guest_allow, indexed_at, sort_name, created_at, updated_at",
     )
     .bind(name)
     .bind(format!("{parent_id}-{name}"))
@@ -194,7 +194,7 @@ pub async fn insert_typed_media(
         r#"INSERT INTO media (name, hash, "type", album_id, width, height, date, size, sort_name)
            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
            RETURNING id, name, hash, "type", album_id, width, height, duration_sec,
-                     date, size, sort_name, created_at, updated_at"#,
+                     date, size, rating_level, sort_name, created_at, updated_at"#,
     )
     .bind(name)
     .bind(hash)
@@ -224,7 +224,13 @@ pub fn v1_names(value: &serde_json::Value, key: &str) -> Vec<String> {
         .as_array()
         .unwrap_or_else(|| panic!("`{key}` is not an array: {value}"))
         .iter()
-        .map(|item| item["name"].as_str().unwrap().to_string())
+        .map(|item| {
+            let name = item["name"].as_str().unwrap();
+            match item["ext"].as_str() {
+                Some(ext) if !ext.is_empty() => format!("{name}.{ext}"),
+                _ => name.to_string(),
+            }
+        })
         .collect()
 }
 
@@ -295,7 +301,7 @@ pub async fn wait_for_media_count(state: &AppState, album_path: &str, expected: 
 pub fn link(state: &AppState, album_hash: &str, media_hash: &str) -> String {
     let exp = Utc::now().timestamp() + 3600;
     let token = state.sign_media(album_hash, media_hash, exp);
-    format!("hash={token}&exp={exp}")
+    format!("sign={token}&exp={exp}")
 }
 
 /// Writes a solid-colour PNG through the `image` crate (test-only dependency).

@@ -9,6 +9,7 @@ use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use axum::response::Response;
 
 use crate::error::AppError;
+use crate::helpers::secure_link;
 use crate::models::{Album, ROOT_ALBUM_HASH};
 use crate::resolvers::resolve_album;
 use crate::state::AppState;
@@ -118,11 +119,11 @@ async fn render_bot_page(
     let url = format!("{base}{canonical_path}");
 
     let image = image.map(|(hash, width, height)| {
-        let exp = crate::secure_link::expires_at(chrono::Utc::now().timestamp());
+        let exp = secure_link::expires_at(chrono::Utc::now().timestamp());
         let token = state.sign_media(&album.hash, &hash, exp);
         OgImage {
             url: format!(
-                "{base}/file/v1/{}/{}?hash={token}&exp={exp}",
+                "{base}/file/v1/{}/{}?sign={token}&exp={exp}",
                 encode_segment(&album.hash),
                 encode_segment(&hash)
             ),

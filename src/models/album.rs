@@ -19,6 +19,17 @@ pub struct Album {
     /// the album is renamed or its URL hash changes. Internal.
     #[serde(skip_serializing, default)]
     pub path: String,
+    /// Canonical URL name; `None` until an admin sets one.
+    pub alias: Option<String>,
+    /// JSON array of former aliases. Internal; the client sees `old_aliases`.
+    #[serde(skip_serializing, default)]
+    pub old_aliases: String,
+    /// Age-rating level, matching the client's rating presets.
+    pub rating_level: Option<i64>,
+    /// Manual position used by `asort=order`; `0` means "not set".
+    pub order_level: i64,
+    /// `None` inherits visibility, `Some(false)` hides, `Some(true)` allows.
+    pub guest_allow: Option<bool>,
     /// Natural-sort key derived from `name`; internal, never sent to clients.
     ///
     /// Writers must call [`crate::models::natural_sort_key`] and store the

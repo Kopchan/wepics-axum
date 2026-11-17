@@ -8,8 +8,8 @@ mod secure;
 mod thumb;
 pub mod types;
 
-pub use album::get_album;
+pub use album::{get_album, list_children};
 pub use file::get_file;
 pub use index::{index_events, start_index};
-pub use media::list_media;
+pub use media::{get_media, list_media};
 pub use thumb::get_thumb;

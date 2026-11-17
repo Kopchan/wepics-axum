@@ -2,3 +2,4 @@
 
 mod album;
 mod media;
+mod stats;

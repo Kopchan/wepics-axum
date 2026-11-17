@@ -1,12 +1,10 @@
--- SVG files are a separate media type now: they scale losslessly and are
--- counted as images by clients, but are neither raster stills nor animations.
---
--- SQLite cannot alter a CHECK constraint in place, so the table is rebuilt.
--- Ids, hashes and timestamps are copied verbatim; the indexes and the
--- `updated_at` trigger are recreated below.
-CREATE TABLE media_new (
+-- Media: files belonging to an album.
+
+CREATE TABLE media (
     id           INTEGER PRIMARY KEY AUTOINCREMENT,
     name         TEXT    NOT NULL,
+    -- Opaque URL identifier: XXH3-64 of the file name and contents,
+    -- URL-safe Base64 (11 chars). See helpers::hashes.
     hash         TEXT    NOT NULL,
     type         TEXT    NOT NULL CHECK (type IN ('image', 'video', 'audio', 'animated', 'vector')),
     album_id     INTEGER NOT NULL REFERENCES albums (id) ON DELETE CASCADE,
@@ -15,39 +13,20 @@ CREATE TABLE media_new (
     duration_sec REAL             CHECK (duration_sec IS NULL OR duration_sec >= 0),
     date         TEXT,
     size         INTEGER NOT NULL DEFAULT 0 CHECK (size >= 0),
+    -- Age-rating level inherited from the rating presets; NULL means unset.
+    rating_level INTEGER,
+    -- Natural-sort key, mirroring albums.sort_name.
     sort_name    TEXT    NOT NULL DEFAULT '',
     created_at   TEXT    NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
     updated_at   TEXT    NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
 );
 
-INSERT INTO media_new (
-    id, name, hash, type, album_id, width, height,
-    duration_sec, date, size, sort_name, created_at, updated_at
-)
-SELECT
-    id, name, hash,
-    CASE type WHEN 'svg' THEN 'vector' ELSE type END,
-    album_id, width, height,
-    duration_sec, date, size, sort_name, created_at, updated_at
-FROM media;
-
-DROP TABLE media;
-ALTER TABLE media_new RENAME TO media;
-
 CREATE INDEX idx_media_album_id ON media (album_id);
 CREATE INDEX idx_media_type ON media (type);
+-- Media URLs are album-scoped, so the same hash may appear in another album.
 CREATE UNIQUE INDEX idx_media_album_hash ON media (album_id, hash);
 CREATE INDEX idx_media_album_date ON media (album_id, date);
 CREATE INDEX idx_media_album_sort_name ON media (album_id, sort_name);
 CREATE INDEX idx_media_album_size ON media (album_id, size);
+-- `photo.jpg` and `photo.png` are distinct media; identity is the full name.
 CREATE UNIQUE INDEX idx_media_album_name ON media (album_id, name);
-
-CREATE TRIGGER media_touch_updated_at
-AFTER UPDATE ON media
-FOR EACH ROW
-WHEN NEW.updated_at = OLD.updated_at
-BEGIN
-    UPDATE media
-       SET updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
-     WHERE id = NEW.id;
-END;

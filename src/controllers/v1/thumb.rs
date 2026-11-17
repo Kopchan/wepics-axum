@@ -4,11 +4,11 @@
 //! so large JPEGs are decoded directly at the target scale using shrink-on-load
 //! instead of being expanded to full size in memory first.
 
-use std::path::Path as FsPath;
+use std::sync::Arc;
 
 use axum::body::Body;
 use axum::extract::{Path, Query, State};
-use axum::http::{HeaderValue, StatusCode, header};
+use axum::http::{StatusCode, header};
 use axum::response::Response;
 
 use crate::error::AppError;
@@ -17,16 +17,16 @@ use crate::models::MediaType;
 use crate::resolvers::{resolve_album, resolve_media};
 use crate::state::AppState;
 
-use super::secure::verify_link;
+use super::secure::{media_cache_control, verify_link};
 use super::types::LinkQuery;
 
-/// `GET /thumb/v1/{album_hash}/{media_hash}/{spec}?hash=&exp=`.
+/// `GET /thumb/v1/{album_hash}/{media_hash}/{spec}?sign=&exp=`.
 pub async fn get_thumb(
     State(state): State<AppState>,
     Path((album_hash, media_hash, spec)): Path<(String, String, String)>,
     Query(query): Query<LinkQuery>,
 ) -> Result<Response, AppError> {
-    verify_link(&state, &album_hash, &media_hash, &query)?;
+    let exp = verify_link(&state, &album_hash, &media_hash, &query)?;
 
     let (direction, size) = parse_spec(&spec)?;
     let album = resolve_album(&state, &album_hash).await?;
@@ -51,49 +51,58 @@ pub async fn get_thumb(
         .join(format!("{direction}{size}"))
         .join(format!("{}.webp", media.hash));
 
+    // Быстрый путь: файл уже есть на диске
     if let Ok(bytes) = tokio::fs::read(&cache_path).await {
-        return Ok(webp_response(bytes));
+        return Ok(webp_response(bytes, exp));
     }
 
-    let bytes = generate(&source, direction, size, &media).await?;
-
-    if let Some(parent) = cache_path.parent() {
-        if let Err(err) = tokio::fs::create_dir_all(parent).await {
-            eprintln!(
-                "cannot create thumbnail directory `{}`: {err}",
-                parent.display()
-            );
-        } else if let Err(err) = tokio::fs::write(&cache_path, &bytes).await {
-            eprintln!("cannot cache thumbnail `{}`: {err}", cache_path.display());
-        }
-    }
-
-    Ok(webp_response(bytes))
-}
-
-async fn generate(
-    source: &FsPath,
-    direction: char,
-    size: u32,
-    media: &crate::models::Media,
-) -> Result<Vec<u8>, AppError> {
-    let source = source.to_path_buf();
+    // Медленный путь: дедупликация генерации через ThumbHub
+    let key = format!("{direction}{size}/{}", media.hash);
     let width = media.width;
     let height = media.height;
-    tokio::task::spawn_blocking(move || render(&source, direction, size, width, height))
+    let cache_path_clone = cache_path.clone();
+
+    let shared_bytes = state
+        .thumb_hub()
+        .get_or_generate(key, move || async move {
+            // Повторная проверка на случай, если файл появился за микросекунду до входа в хаб
+            if let Ok(existing) = tokio::fs::read(&cache_path_clone).await {
+                return Ok(existing);
+            }
+
+            let bytes = tokio::task::spawn_blocking(move || {
+                render(&source, direction, size, width, height)
+            })
+            .await
+            .map_err(|err| format!("thumbnail worker failed: {err}"))??;
+
+            // Атомарная запись на диск через временный файл
+            if let Some(parent) = cache_path_clone.parent()
+                && tokio::fs::create_dir_all(parent).await.is_ok()
+            {
+                // Имя уникально для пары «медиа + размер», поэтому параллельные
+                // генерации разных превью не перетирают временные файлы.
+                let tmp_path = cache_path_clone.with_extension("tmp");
+                if tokio::fs::write(&tmp_path, &bytes).await.is_ok() {
+                    let _ = tokio::fs::rename(&tmp_path, &cache_path_clone).await;
+                }
+            }
+
+            Ok(bytes)
+        })
         .await
-        .map_err(|err| AppError::Internal(format!("thumbnail worker failed: {err}")))?
-        .map_err(AppError::Internal)
+        .map_err(AppError::Internal)?;
+
+    // Извлекаем Vec<u8> без копирования, если мы последний владелец Arc, или клонируем при необходимости
+    let bytes = Arc::unwrap_or_clone(shared_bytes);
+    Ok(webp_response(bytes, exp))
 }
 
-fn webp_response(bytes: Vec<u8>) -> Response {
+fn webp_response(bytes: Vec<u8>, exp: i64) -> Response {
     Response::builder()
         .status(StatusCode::OK)
         .header(header::CONTENT_TYPE, "image/webp")
-        .header(
-            header::CACHE_CONTROL,
-            HeaderValue::from_static("private, max-age=86400, immutable"),
-        )
+        .header(header::CACHE_CONTROL, media_cache_control(exp))
         .header(header::CONTENT_LENGTH, bytes.len())
         .body(Body::from(bytes))
         .expect("static response parts are valid")

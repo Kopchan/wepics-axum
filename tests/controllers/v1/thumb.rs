@@ -93,7 +93,7 @@ async fn previews_require_a_valid_signature() {
 
     let (status, _, _) = send(
         &app,
-        &format!("/thumb/v1/root/media1/w144?hash=bad&exp={exp}"),
+        &format!("/thumb/v1/root/media1/w144?sign=bad&exp={exp}"),
     )
     .await;
     assert_eq!(status, StatusCode::FORBIDDEN);
@@ -102,7 +102,7 @@ async fn previews_require_a_valid_signature() {
     let expired = state.sign_media("root", "media1", expired_at);
     let (status, _, _) = send(
         &app,
-        &format!("/thumb/v1/root/media1/w144?hash={expired}&exp={expired_at}"),
+        &format!("/thumb/v1/root/media1/w144?sign={expired}&exp={expired_at}"),
     )
     .await;
     assert_eq!(status, StatusCode::FORBIDDEN);
@@ -111,7 +111,7 @@ async fn previews_require_a_valid_signature() {
     let other = state.sign_media("root", "other", exp);
     let (status, _, _) = send(
         &app,
-        &format!("/thumb/v1/root/media1/w144?hash={other}&exp={exp}"),
+        &format!("/thumb/v1/root/media1/w144?sign={other}&exp={exp}"),
     )
     .await;
     assert_eq!(status, StatusCode::FORBIDDEN);
@@ -121,7 +121,7 @@ async fn previews_require_a_valid_signature() {
     let missing_token = state.sign_media("root", "missing", missing_exp);
     let (status, _, _) = send(
         &app,
-        &format!("/thumb/v1/root/missing/w144?hash={missing_token}&exp={missing_exp}"),
+        &format!("/thumb/v1/root/missing/w144?sign={missing_token}&exp={missing_exp}"),
     )
     .await;
     assert_eq!(status, StatusCode::NOT_FOUND);

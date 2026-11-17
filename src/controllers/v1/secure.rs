@@ -1,9 +1,10 @@
 //! Link validation shared by the thumbnail and original-file handlers.
 
+use axum::http::HeaderValue;
 use chrono::Utc;
 
 use crate::error::AppError;
-use crate::secure_link;
+use crate::helpers::secure_link;
 use crate::state::AppState;
 
 use super::types::LinkQuery;
@@ -13,18 +14,17 @@ pub fn link_expiry() -> i64 {
     secure_link::expires_at(Utc::now().timestamp())
 }
 
-/// Extracts the token and expiry, then verifies both against the album/media
-/// pair.
+/// Extracts the token and expiry, verifies both, and returns the validated `exp`.
 pub fn verify_link(
     state: &AppState,
     album_hash: &str,
     media_hash: &str,
     query: &LinkQuery,
-) -> Result<(), AppError> {
+) -> Result<i64, AppError> {
     let token = query
-        .hash
+        .sign
         .as_deref()
-        .ok_or_else(|| AppError::Forbidden("missing `hash` link parameter".into()))?;
+        .ok_or_else(|| AppError::Forbidden("missing `sign` link parameter".into()))?;
     let exp = query
         .exp
         .ok_or_else(|| AppError::Forbidden("missing `exp` link parameter".into()))?;
@@ -33,5 +33,16 @@ pub fn verify_link(
         return Err(AppError::Forbidden("invalid or expired media link".into()));
     }
 
-    Ok(())
+    Ok(exp)
+}
+
+/// Builds a `Cache-Control` header matching the remaining lifetime of `exp`.
+pub fn media_cache_control(exp: i64) -> HeaderValue {
+    let max_age = (exp - Utc::now().timestamp()).max(0);
+    if max_age == 0 {
+        return HeaderValue::from_static("no-store");
+    }
+
+    HeaderValue::from_str(&format!("private, max-age={max_age}, immutable"))
+        .unwrap_or_else(|_| HeaderValue::from_static("no-store"))
 }

@@ -12,7 +12,8 @@ use std::path::{Path, PathBuf};
 use chrono::{DateTime, Duration, Utc};
 use sqlx::SqlitePool;
 
-use crate::index_hub::{IndexEvent, IndexHub, IndexPhase};
+use crate::helpers::hashes;
+use crate::hubs::indexer::{IndexEvent, IndexHub, IndexPhase};
 use crate::models::{Album, MediaType, natural_sort_key};
 use crate::state::{AppState, is_safe_segment};
 
@@ -24,15 +25,17 @@ const STALE_AFTER_HOURS: i64 = 1;
 
 const UPSERT_MEDIA: &str = r#"
 INSERT INTO media (name, hash, "type", album_id, width, height, size, date, sort_name)
-VALUES (?1, lower(hex(randomblob(12))), ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
 ON CONFLICT(album_id, name) DO UPDATE SET
+    hash = excluded.hash,
     "type" = excluded."type",
     width = excluded.width,
     height = excluded.height,
     size = excluded.size,
     date = excluded.date,
     sort_name = excluded.sort_name
-WHERE media."type" <> excluded."type"
+WHERE media.hash <> excluded.hash
+   OR media."type" <> excluded."type"
    OR media.width <> excluded.width
    OR media.height <> excluded.height
    OR media.size <> excluded.size
@@ -40,7 +43,8 @@ WHERE media."type" <> excluded."type"
    OR media.sort_name <> excluded.sort_name
 "#;
 
-const ALBUM_SELECT: &str = "SELECT id, name, hash, parent_id, path, indexed_at, sort_name, \
+const ALBUM_SELECT: &str = "SELECT id, name, hash, parent_id, path, alias, old_aliases, \
+     rating_level, order_level, guest_allow, indexed_at, sort_name, \
      created_at, updated_at FROM albums WHERE id = ?1";
 
 /// Options for a manual index request.
@@ -251,10 +255,18 @@ async fn sync_one(
             progress.new_media += 1;
         }
 
-        let (width, height) = image_dimensions(entry).await;
+        let (width, height, hash) = match probe_file(entry).await {
+            Ok(probed) => probed,
+            Err(err) => {
+                eprintln!("skipping `{}`: {err}", entry.path.display());
+                progress.files_done += 1;
+                continue;
+            }
+        };
 
         batch.push(ScannedFile {
             name: entry.name.clone(),
+            hash,
             media_type: entry.media_type,
             width,
             height,
@@ -301,10 +313,11 @@ async fn sync_one(
         for child in &dirs {
             let inserted = sqlx::query(
                 "INSERT INTO albums (name, hash, sort_name, parent_id, path)
-                 VALUES (?1, lower(hex(randomblob(12))), ?2, ?3, ?4)
+                 VALUES (?1, ?2, ?3, ?4, ?5)
                  ON CONFLICT(path) DO NOTHING",
             )
             .bind(&child.name)
+            .bind(hashes::album_hash())
             .bind(natural_sort_key(&child.name))
             .bind(album.id)
             .bind(&child.path)
@@ -357,6 +370,7 @@ async fn write_media_batch(
     for file in batch {
         sqlx::query(UPSERT_MEDIA)
             .bind(&file.name)
+            .bind(&file.hash)
             .bind(file.media_type)
             .bind(album.id)
             .bind(file.width)
@@ -518,6 +532,7 @@ async fn count_tree(dir: &Path) -> std::io::Result<(u64, u64)> {
 
 struct ScannedFile {
     name: String,
+    hash: String,
     media_type: MediaType,
     width: i64,
     height: i64,
@@ -637,28 +652,32 @@ fn join_path(parent: &str, name: &str) -> String {
     }
 }
 
-/// Reads image dimensions from the file header.
+/// Reads image dimensions and hashes the file in one blocking pass.
 ///
 /// Still and animated images use a lightweight header parser; vectors need
 /// libvips because SVG has no raster header. Videos and audio keep `0`, which
 /// the API treats as "unknown". A malformed or unsupported file is not an
 /// indexing error, it simply has no dimensions.
-async fn image_dimensions(entry: &MediaEntry) -> (i64, i64) {
+async fn probe_file(entry: &MediaEntry) -> std::io::Result<(i64, i64, String)> {
+    let path = entry.path.clone();
+    let media_type = entry.media_type;
+    tokio::task::spawn_blocking(move || {
+        let (width, height) = probe_dimensions(&path, media_type);
+        let hash = hashes::media_hash(&path)?;
+        Ok((width, height, hash))
+    })
+    .await
+    .map_err(|err| std::io::Error::other(err.to_string()))?
+}
+
+fn probe_dimensions(path: &Path, media_type: MediaType) -> (i64, i64) {
     if !matches!(
-        entry.media_type,
+        media_type,
         MediaType::Image | MediaType::Animated | MediaType::Vector
     ) {
         return (0, 0);
     }
 
-    let path = entry.path.clone();
-    let media_type = entry.media_type;
-    tokio::task::spawn_blocking(move || probe_dimensions(&path, media_type))
-        .await
-        .unwrap_or((0, 0))
-}
-
-fn probe_dimensions(path: &Path, media_type: MediaType) -> (i64, i64) {
     let dimensions = if media_type == MediaType::Vector {
         vips_dimensions(path)
     } else {

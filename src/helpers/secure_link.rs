@@ -8,14 +8,16 @@
 use hmac::{Hmac, Mac};
 use sha2::Sha256;
 
-/// Media links are valid for six hours.
+/// Media links are valid for 3 to 6 hours, quantized into 3-hour buckets
+/// so identical URLs are generated within the same window for browser caching.
 pub const TOKEN_TTL_SECONDS: i64 = 6 * 60 * 60;
+pub const BUCKET_SECONDS: i64 = TOKEN_TTL_SECONDS / 2;
 
 type HmacSha256 = Hmac<Sha256>;
 
-/// Unix timestamp of a link issued at `now`.
+/// Quantized Unix timestamp for a link issued at `now`.
 pub fn expires_at(now: i64) -> i64 {
-    now + TOKEN_TTL_SECONDS
+    (now / BUCKET_SECONDS) * BUCKET_SECONDS + TOKEN_TTL_SECONDS
 }
 
 /// Hex-encoded HMAC-SHA256 of `album_hash:media_hash:exp`.

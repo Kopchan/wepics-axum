@@ -15,12 +15,10 @@ use crate::error::AppError;
 use crate::resolvers::{resolve_album, resolve_media};
 use crate::state::AppState;
 
-use super::secure::verify_link;
+use super::secure::{media_cache_control, verify_link};
 use super::types::LinkQuery;
 
-const CACHE_CONTROL_VALUE: &str = "public, max-age=3600, immutable";
-
-/// `GET /file/v1/{album_hash}/{media_hash}?hash=&exp=`.
+/// `GET /file/v1/{album_hash}/{media_hash}?sign=&exp=`.
 pub async fn get_file(
     State(state): State<AppState>,
     Path((album_hash, media_hash)): Path<(String, String)>,
@@ -28,7 +26,7 @@ pub async fn get_file(
     method: Method,
     headers: HeaderMap,
 ) -> Result<Response, AppError> {
-    verify_link(&state, &album_hash, &media_hash, &query)?;
+    let exp = verify_link(&state, &album_hash, &media_hash, &query)?;
 
     let album = resolve_album(&state, &album_hash).await?;
     let media = resolve_media(&state, &album, &media_hash).await?;
@@ -57,10 +55,7 @@ pub async fn get_file(
     ))
     .unwrap_or_else(|_| HeaderValue::from_static("inline"));
 
-    let cache = SetResponseHeaderLayer::overriding(
-        CACHE_CONTROL,
-        HeaderValue::from_static(CACHE_CONTROL_VALUE),
-    );
+    let cache = SetResponseHeaderLayer::overriding(CACHE_CONTROL, media_cache_control(exp));
     let content_disposition = SetResponseHeaderLayer::overriding(CONTENT_DISPOSITION, disposition);
     let service = content_disposition
         .layer(cache.layer(ServeFile::new(&path).ignore_multi_range_requests(true)));
