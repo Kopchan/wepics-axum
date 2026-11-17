@@ -38,9 +38,25 @@ async fn files_are_served_with_inline_disposition_and_caching() {
             .unwrap()
             .starts_with("inline"),
     );
-    assert_eq!(
-        headers[header::CACHE_CONTROL],
-        "public, max-age=3600, immutable"
+    // Signed links belong to one viewer, so the browser may cache them but
+    // shared proxies must not.
+    let cache = headers[header::CACHE_CONTROL].to_str().unwrap();
+    assert!(
+        cache.starts_with("private, max-age="),
+        "unexpected cache-control: {cache}"
+    );
+    assert!(
+        cache.ends_with(", immutable"),
+        "unexpected cache-control: {cache}"
+    );
+    let max_age: i64 = cache
+        .trim_start_matches("private, max-age=")
+        .trim_end_matches(", immutable")
+        .parse()
+        .unwrap();
+    assert!(
+        (3595..=3600).contains(&max_age),
+        "max-age should match the link lifetime, got {max_age}"
     );
 
     // Metadata exists, but the file on disk does not.
@@ -184,14 +200,14 @@ async fn files_require_a_valid_signature() {
     let (status, _, _) = send(&app, "/file/v1/root/media1").await;
     assert_eq!(status, StatusCode::FORBIDDEN);
 
-    let (status, _, _) = send(&app, &format!("/file/v1/root/media1?hash=bad&exp={exp}")).await;
+    let (status, _, _) = send(&app, &format!("/file/v1/root/media1?sign=bad&exp={exp}")).await;
     assert_eq!(status, StatusCode::FORBIDDEN);
 
     let expired_at = chrono::Utc::now().timestamp() - 10;
     let expired = state.sign_media("root", "media1", expired_at);
     let (status, _, _) = send(
         &app,
-        &format!("/file/v1/root/media1?hash={expired}&exp={expired_at}"),
+        &format!("/file/v1/root/media1?sign={expired}&exp={expired_at}"),
     )
     .await;
     assert_eq!(status, StatusCode::FORBIDDEN);
@@ -200,7 +216,7 @@ async fn files_require_a_valid_signature() {
     let other = state.sign_media("root", "other", exp);
     let (status, _, _) = send(
         &app,
-        &format!("/file/v1/root/media1?hash={other}&exp={exp}"),
+        &format!("/file/v1/root/media1?sign={other}&exp={exp}"),
     )
     .await;
     assert_eq!(status, StatusCode::FORBIDDEN);

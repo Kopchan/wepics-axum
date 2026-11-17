@@ -1,13 +1,15 @@
-use std::collections::HashSet;
 use std::path::PathBuf;
 use std::str::FromStr;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::Duration;
 
 use sqlx::SqlitePool;
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions};
 
-use crate::index_hub::IndexHub;
+use crate::helpers::secure_link;
+use crate::hubs::indexer::IndexHub;
+use crate::hubs::sync_tracker::{SyncGuard, SyncTracker};
+use crate::hubs::thumb::ThumbHub;
 use crate::models::{Album, Media, ROOT_ALBUM_HASH};
 
 /// Shared application state, cloned into every handler by axum.
@@ -27,6 +29,8 @@ pub struct AppState {
     write_gate: Arc<tokio::sync::Mutex<()>>,
     /// Progress broadcast for running index jobs.
     index_hub: IndexHub,
+    /// Deduplicates concurrent thumbnail generation requests.
+    thumb_hub: ThumbHub,
 }
 
 impl AppState {
@@ -40,9 +44,10 @@ impl AppState {
             media_dir: media_dir.into(),
             cache_dir: cache_dir.into(),
             secret: Arc::new(random_secret()),
-            syncing: SyncTracker::default(),
             write_gate: Arc::new(tokio::sync::Mutex::new(())),
+            syncing: SyncTracker::default(),
             index_hub: IndexHub::default(),
+            thumb_hub: ThumbHub::default(),
         }
     }
 
@@ -109,12 +114,12 @@ impl AppState {
 
     /// Short-lived signature for `/thumb/v1` and `/file/v1`.
     pub fn sign_media(&self, album_hash: &str, media_hash: &str, exp: i64) -> String {
-        crate::secure_link::token(self.secret.as_ref(), album_hash, media_hash, exp)
+        secure_link::token(self.secret.as_ref(), album_hash, media_hash, exp)
     }
 
     /// Validates a media link signature and its expiry.
     pub fn verify_media(&self, album_hash: &str, media_hash: &str, token: &str, exp: i64) -> bool {
-        crate::secure_link::verify(
+        secure_link::verify(
             self.secret.as_ref(),
             album_hash,
             media_hash,
@@ -167,6 +172,11 @@ impl AppState {
     pub(crate) fn index_hub(&self) -> &IndexHub {
         &self.index_hub
     }
+
+    /// Shared thumbnail deduplication hub.
+    pub(crate) fn thumb_hub(&self) -> &ThumbHub {
+        &self.thumb_hub
+    }
 }
 
 pub(crate) fn is_safe_segment(segment: &str) -> bool {
@@ -191,49 +201,6 @@ fn random_secret() -> [u8; 32] {
     hasher.update(std::process::id().to_le_bytes());
     secret.copy_from_slice(&hasher.finalize());
     secret
-}
-
-/// In-memory set of albums with an indexing task in flight.
-///
-/// Uniqueness is per process: one task per album, and the entry is removed when
-/// the task finishes or unwinds.
-#[derive(Clone, Default)]
-pub(crate) struct SyncTracker {
-    running: Arc<Mutex<HashSet<i64>>>,
-}
-
-impl SyncTracker {
-    pub(crate) fn try_claim(&self, album_id: i64) -> Option<SyncGuard> {
-        let mut running = self
-            .running
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-
-        if !running.insert(album_id) {
-            return None;
-        }
-
-        Some(SyncGuard {
-            album_id,
-            running: Arc::clone(&self.running),
-        })
-    }
-}
-
-/// Releases an album's sync slot on drop, including on panic.
-pub(crate) struct SyncGuard {
-    album_id: i64,
-    running: Arc<Mutex<HashSet<i64>>>,
-}
-
-impl Drop for SyncGuard {
-    fn drop(&mut self) {
-        let mut running = self
-            .running
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        running.remove(&self.album_id);
-    }
 }
 
 #[cfg(test)]

@@ -51,7 +51,7 @@ async fn root_and_album_pages_are_spa_for_people_and_og_for_bots() {
         "album name must be escaped"
     );
     assert!(
-        html.contains("/file/v1/trip/h1?hash="),
+        html.contains("/file/v1/trip/h1?sign="),
         "OG image must use the signed v1 file link: {html}"
     );
     assert!(html.contains("og:image:width"));

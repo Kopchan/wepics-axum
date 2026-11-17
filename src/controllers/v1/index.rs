@@ -13,7 +13,7 @@ use tokio_stream::{Stream, StreamExt};
 
 use crate::error::AppError;
 use crate::helpers::flags::flag;
-use crate::index_hub::IndexEvent;
+use crate::hubs::indexer::IndexEvent;
 use crate::indexer::{self, IndexOptions};
 use crate::resolvers::resolve_album;
 use crate::state::AppState;

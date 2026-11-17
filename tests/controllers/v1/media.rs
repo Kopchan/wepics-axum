@@ -3,8 +3,8 @@
 use axum::http::StatusCode;
 
 use crate::common::{
-    NewMedia, app, at, insert_media, insert_typed_media, parse_v1, root_album_id, send, setup,
-    v1_names,
+    NewMedia, app, at, insert_child, insert_media, insert_typed_media, parse_v1, root_album_id,
+    send, setup, v1_names,
 };
 use wepics_axum::models::MediaType;
 
@@ -48,20 +48,18 @@ async fn media_paginates_sorts_and_filters() {
     .await;
     assert_eq!(status, StatusCode::OK);
     let page = parse_v1(&body);
-    assert_eq!(page["page"], 2);
-    assert_eq!(page["per_page"], 2);
     assert_eq!(page["total"], 5);
-    assert_eq!(page["pages"], 3);
-    assert_eq!(
-        v1_names(&page, "pictures"),
-        vec!["photo3.jpg", "photo4.jpg"]
+    assert!(
+        page.get("page").is_none(),
+        "lists return `{{total, items}}`"
     );
+    assert_eq!(v1_names(&page, "items"), vec!["photo3.jpg", "photo4.jpg"]);
 
     let (status, _, body) = send(&app, "/api/v1/album/root/media?sort=-size").await;
     assert_eq!(status, StatusCode::OK);
     let page = parse_v1(&body);
     assert_eq!(
-        v1_names(&page, "pictures"),
+        v1_names(&page, "items"),
         vec![
             "clip.mp4",
             "photo5.jpg",
@@ -72,11 +70,15 @@ async fn media_paginates_sorts_and_filters() {
         ]
     );
 
-    let picture = &page["pictures"][0];
-    let media_hash = picture["mediaHash"].as_str().unwrap();
-    let token = picture["hash"].as_str().unwrap();
+    let picture = &page["items"][0];
+    let media_hash = picture["hash"].as_str().unwrap();
+    let token = picture["sign"].as_str().unwrap();
     let exp = picture["exp"].as_i64().unwrap();
     assert!(state.verify_media("root", media_hash, token, exp));
+
+    let (status, _, body) = send(&app, "/api/v1/album/root/media?limit=*&sort=name").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(v1_names(&parse_v1(&body), "items").len(), 6);
 
     let (status, _, _) = send(&app, "/api/v1/album/root/media?type=bogus").await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
@@ -109,21 +111,11 @@ async fn name_sort_is_natural_and_reversible() {
     let app = app(state);
 
     let (_, _, body) = send(&app, "/api/v1/album/abc123/media?sort=name").await;
-    let names: Vec<_> = parse_v1(&body)["pictures"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .map(|media| media["name"].as_str().unwrap().to_string())
-        .collect();
+    let names = v1_names(&parse_v1(&body), "items");
     assert_eq!(names, vec!["img1.jpg", "img2.jpg", "img10.jpg"]);
 
     let (_, _, body) = send(&app, "/api/v1/album/abc123/media?sort=-name").await;
-    let names: Vec<_> = parse_v1(&body)["pictures"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .map(|media| media["name"].as_str().unwrap().to_string())
-        .collect();
+    let names = v1_names(&parse_v1(&body), "items");
     assert_eq!(names, vec!["img10.jpg", "img2.jpg", "img1.jpg"]);
 
     drop(dir);
@@ -150,13 +142,10 @@ async fn size_sort_is_supported() {
 
     let app = app(state);
     let (_, _, body) = send(&app, "/api/v1/album/abc123/media?sort=-size").await;
-    let names: Vec<_> = parse_v1(&body)["pictures"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .map(|media| media["name"].as_str().unwrap().to_string())
-        .collect();
-    assert_eq!(names, vec!["c.jpg", "b.jpg", "a.jpg"]);
+    assert_eq!(
+        v1_names(&parse_v1(&body), "items"),
+        vec!["c.jpg", "b.jpg", "a.jpg"]
+    );
 
     drop(dir);
 }
@@ -194,10 +183,10 @@ async fn type_filter_accepts_vectors() {
 
     let (status, _, body) = send(&app, "/api/v1/album/root/media?type=vec").await;
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(v1_names(&parse_v1(&body), "pictures"), vec!["logo.svg"]);
+    assert_eq!(v1_names(&parse_v1(&body), "items"), vec!["logo.svg"]);
 
     let (_, _, body) = send(&app, "/api/v1/album/root/media?type=img,vec").await;
-    assert_eq!(v1_names(&parse_v1(&body), "pictures").len(), 2);
+    assert_eq!(v1_names(&parse_v1(&body), "items").len(), 2);
 
     drop(dir);
 }
@@ -223,6 +212,112 @@ async fn invalid_pagination_and_sort_are_bad_requests() {
             String::from_utf8_lossy(&body)
         );
     }
+
+    drop(dir);
+}
+
+#[tokio::test]
+async fn nest_includes_descendant_media() {
+    let (dir, state) = setup().await;
+    let root_id = root_album_id(&state).await;
+    let child = insert_child(&state.db, root_id, "Child", at(1)).await;
+    let grand = insert_child(&state.db, child.id, "Grand", at(1)).await;
+
+    insert_media(
+        &state.db,
+        root_id,
+        NewMedia {
+            name: "root.jpg",
+            hash: "root-m",
+            date: Some(at(1)),
+            size: 10,
+        },
+    )
+    .await;
+    insert_media(
+        &state.db,
+        child.id,
+        NewMedia {
+            name: "child.jpg",
+            hash: "child-m",
+            date: Some(at(2)),
+            size: 10,
+        },
+    )
+    .await;
+    insert_media(
+        &state.db,
+        grand.id,
+        NewMedia {
+            name: "grand.jpg",
+            hash: "grand-m",
+            date: Some(at(3)),
+            size: 10,
+        },
+    )
+    .await;
+
+    let app = app(state);
+
+    let (_, _, body) = send(&app, "/api/v1/album/root/media?sort=name").await;
+    assert_eq!(v1_names(&parse_v1(&body), "items"), vec!["root.jpg"]);
+
+    let (status, _, body) = send(&app, "/api/v1/album/root/media?sort=name&nest").await;
+    assert_eq!(status, StatusCode::OK);
+    let page = parse_v1(&body);
+    assert_eq!(page["total"], 3, "nest walks the whole subtree");
+    assert_eq!(
+        v1_names(&page, "items"),
+        vec!["child.jpg", "grand.jpg", "root.jpg"]
+    );
+    assert_eq!(
+        page["items"][0]["album"]["hash"], child.hash,
+        "nested media name their own album"
+    );
+    assert_eq!(page["items"][1]["album"]["hash"], grand.hash);
+    assert!(
+        page["items"][2].get("album").is_none(),
+        "media of the requested album omit `album`"
+    );
+
+    drop(dir);
+}
+
+#[tokio::test]
+async fn single_media_info_carries_signature_without_album() {
+    let (dir, state) = setup().await;
+    let root_id = root_album_id(&state).await;
+
+    insert_media(
+        &state.db,
+        root_id,
+        NewMedia {
+            name: "photo1.jpg",
+            hash: "m1",
+            date: Some(at(1)),
+            size: 10,
+        },
+    )
+    .await;
+
+    let app = app(state.clone());
+    let (status, _, body) = send(&app, "/api/v1/album/root/media/m1").await;
+    assert_eq!(status, StatusCode::OK);
+    let media = parse_v1(&body);
+    assert_eq!(media["hash"], "m1");
+    assert_eq!(media["name"], "photo1");
+    assert_eq!(media["ext"], "jpg");
+    assert_eq!(media["type"], "image");
+    assert!(
+        media.get("album").is_none(),
+        "the request path already names the album"
+    );
+
+    let exp = media["exp"].as_i64().unwrap();
+    assert!(state.verify_media("root", "m1", media["sign"].as_str().unwrap(), exp));
+
+    let (status, _, _) = send(&app, "/api/v1/album/root/media/missing").await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
 
     drop(dir);
 }

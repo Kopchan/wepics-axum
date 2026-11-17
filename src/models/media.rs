@@ -37,6 +37,8 @@ pub struct Media {
     pub date: Option<DateTime<Utc>>,
     /// File size in bytes, used by `?sort=size`.
     pub size: i64,
+    /// Age-rating level, matching the client's rating presets.
+    pub rating_level: Option<i64>,
     /// Natural-sort key derived from `name`; internal, never sent to clients.
     #[serde(skip_serializing, default)]
     pub sort_name: String,
