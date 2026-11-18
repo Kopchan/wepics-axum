@@ -22,8 +22,8 @@ use super::secure::link_expiry;
 use super::types::{
     ALBUM_FIELDS_QUALIFIED, AlbumItem, AlbumQuery, AlbumSort, AlbumStatsPair, Limit, MediaItem,
     MediaPreview, MediaSort, PaginateRes, load_album_stats_map, load_children_batch,
-    load_media_previews, parse_album_sort, parse_layer_bools, parse_layer_limits, parse_limit,
-    parse_media_sort, parse_media_types, push_album_order,
+    load_content_sort_map, load_media_previews, parse_album_sort, parse_layer_bools,
+    parse_layer_limits, parse_limit, parse_media_sort, parse_media_types, push_album_order,
 };
 
 /// Album info defaults: no children and no media unless the client asks.
@@ -52,6 +52,8 @@ struct AlbumTree {
     /// Previews per album, already ordered and limited by `mlimit`.
     media: HashMap<i64, Vec<MediaItem>>,
     stats: HashMap<i64, AlbumStatsPair>,
+    /// `contentSort` value per album for a `content:<field>` sort.
+    content: HashMap<i64, String>,
 }
 
 impl AlbumTree {
@@ -140,18 +142,21 @@ impl AlbumTree {
         stats_ids.sort_unstable();
         stats_ids.dedup();
         let stats = load_album_stats_map(&state.db, &stats_ids).await?;
+        let content = load_content_sort_map(&state.db, &stats_ids, config.album_sort).await?;
 
         Ok(Self {
             albums,
             children,
             media,
             stats,
+            content,
         })
     }
 
     fn build_item(&self, id: i64) -> AlbumItem {
         let album = self.albums.get(&id).expect("album tree is complete");
         let mut item = AlbumItem::new(album, self.stats_for(id));
+        item.content_sort = self.content_for(id);
 
         if let Some(previews) = self.media.get(&id) {
             item.media = Some(previews.clone());
@@ -171,6 +176,10 @@ impl AlbumTree {
 
     fn stats_for(&self, id: i64) -> AlbumStatsPair {
         self.stats.get(&id).copied().unwrap_or_default()
+    }
+
+    fn content_for(&self, id: i64) -> Option<String> {
+        self.content.get(&id).cloned()
     }
 }
 
@@ -230,7 +239,11 @@ pub async fn get_album(
         item.ancestors = Some(
             ancestors
                 .iter()
-                .map(|ancestor| AlbumItem::new(ancestor, tree.stats_for(ancestor.id)))
+                .map(|ancestor| {
+                    let mut item = AlbumItem::new(ancestor, tree.stats_for(ancestor.id));
+                    item.content_sort = tree.content_for(ancestor.id);
+                    item
+                })
                 .collect(),
         );
     }

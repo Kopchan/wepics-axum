@@ -22,4 +22,5 @@ pub fn router() -> Router<AppState> {
             "/album/{hash}/index/events",
             get(controllers::v1::index_events),
         )
+        .route("/index/events", get(controllers::v1::all_index_events))
 }

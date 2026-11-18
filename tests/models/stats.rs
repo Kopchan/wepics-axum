@@ -17,6 +17,7 @@ struct Counters {
     images_count: i64,
     videos_count: i64,
     audios_count: i64,
+    duplica_count: i64,
     albums_count: i64,
     size: i64,
     duration: f64,
@@ -26,7 +27,7 @@ struct Counters {
 async fn counters(pool: &SqlitePool, album_id: i64) -> Option<Counters> {
     sqlx::query_as(
         "SELECT medias_count, images_count, videos_count, audios_count, \
-                albums_count, size, duration \
+                duplica_count, albums_count, size, duration \
          FROM album_stats WHERE album_id = ?1",
     )
     .bind(album_id)
@@ -161,6 +162,7 @@ async fn media_triggers_keep_counters_in_sync() {
             images_count: 2,
             videos_count: 2,
             audios_count: 1,
+            duplica_count: 0,
             albums_count: 0,
             size: 1520,
             duration: 0.0,
@@ -184,6 +186,7 @@ async fn media_triggers_keep_counters_in_sync() {
             images_count: 2,
             videos_count: 1,
             audios_count: 1,
+            duplica_count: 0,
             albums_count: 0,
             size: 1120,
             duration: 0.0,
@@ -196,6 +199,7 @@ async fn media_triggers_keep_counters_in_sync() {
             images_count: 0,
             videos_count: 1,
             audios_count: 0,
+            duplica_count: 0,
             albums_count: 0,
             size: 400,
             duration: 12.5,
@@ -312,6 +316,21 @@ async fn nested_stats_sum_the_subtree_without_the_root() {
         .await
         .unwrap();
 
+    // A copy in the deepest album also shows up in every ancestor's nested count.
+    let bravo_media_id: i64 = sqlx::query_scalar("SELECT id FROM media WHERE hash = 'bravo-m'")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    sqlx::query(
+        "INSERT INTO duplica (name, media_id, album_id, data) \
+         VALUES ('bravo-copy.jpg', ?1, ?2, '{}')",
+    )
+    .bind(bravo_media_id)
+    .bind(bravo.id)
+    .execute(&pool)
+    .await
+    .unwrap();
+
     let stats = load_album_stats_map(&pool, &[root.id, alpha.id, bravo.id])
         .await
         .unwrap();
@@ -327,6 +346,7 @@ async fn nested_stats_sum_the_subtree_without_the_root() {
             images_count: 2,
             videos_count: 0,
             audios_count: 1,
+            duplica_count: 1,
             albums_count: 2,
             size: 60,
             duration: 5.5,
@@ -337,17 +357,82 @@ async fn nested_stats_sum_the_subtree_without_the_root() {
     let alpha_stats = stats[&alpha.id];
     assert_eq!(alpha_stats.direct.medias_count, 1);
     assert_eq!(alpha_stats.nested.medias_count, 2);
+    assert_eq!(alpha_stats.nested.duplica_count, 1);
     assert_eq!(alpha_stats.nested.albums_count, 1);
     assert_eq!(alpha_stats.nested.size, 50);
     assert_eq!(alpha_stats.nested.duration, 5.5);
 
     let bravo_stats = stats[&bravo.id];
     assert_eq!(bravo_stats.direct.medias_count, 2);
+    assert_eq!(bravo_stats.direct.duplica_count, 1);
+    assert_eq!(bravo_stats.nested.duplica_count, 0);
     assert_eq!(
         bravo_stats.nested,
         wepics_axum::controllers::v1::types::AlbumStats::default(),
         "a leaf album has no nested counters"
     );
+
+    drop(pool);
+}
+
+#[tokio::test]
+async fn duplica_triggers_keep_the_counter_in_sync() {
+    let pool = test_pool().await;
+    let album = insert_album(&pool, "Album", "album-hash").await;
+    let owner = insert_typed_media(
+        &pool,
+        album.id,
+        "photo.jpg",
+        "m-photo",
+        MediaType::Image,
+        10,
+        10,
+        None,
+        100,
+    )
+    .await;
+
+    sqlx::query(
+        "INSERT INTO duplica (name, media_id, album_id, data) VALUES ('copy.jpg', ?1, ?2, '{}')",
+    )
+    .bind(owner.id)
+    .bind(album.id)
+    .execute(&pool)
+    .await
+    .unwrap();
+    assert_eq!(counters(&pool, album.id).await.unwrap().duplica_count, 1);
+
+    // A rename keeps the count unchanged.
+    sqlx::query("UPDATE duplica SET name = 'renamed.jpg' WHERE album_id = ?1")
+        .bind(album.id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    assert_eq!(counters(&pool, album.id).await.unwrap().duplica_count, 1);
+
+    // Deleting the copy subtracts it.
+    sqlx::query("DELETE FROM duplica WHERE album_id = ?1")
+        .bind(album.id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    assert_eq!(counters(&pool, album.id).await.unwrap().duplica_count, 0);
+
+    // Deleting the owner cascades the remaining copies and their counter.
+    sqlx::query(
+        "INSERT INTO duplica (name, media_id, album_id, data) VALUES ('copy.jpg', ?1, ?2, '{}')",
+    )
+    .bind(owner.id)
+    .bind(album.id)
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query("DELETE FROM media WHERE id = ?1")
+        .bind(owner.id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    assert_eq!(counters(&pool, album.id).await.unwrap().duplica_count, 0);
 
     drop(pool);
 }

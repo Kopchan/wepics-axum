@@ -59,12 +59,14 @@ pub async fn index_events(
     State(state): State<AppState>,
     Path(hash): Path<String>,
 ) -> Result<Sse<SseStream>, AppError> {
-    let _album = resolve_album(&state, &hash).await?;
+    let album = resolve_album(&state, &hash).await?;
 
     let hub = state.index_hub();
     let receiver = hub.subscribe();
-    let snapshot = hub.latest(&hash);
-    let filter_hash = hash.clone();
+    // Jobs are keyed by canonical hash, so an alias link must be resolved
+    // first; otherwise the snapshot and the filter would both come up empty.
+    let snapshot = hub.latest(&album.hash);
+    let filter_hash = album.hash.clone();
 
     let initial = tokio_stream::iter(snapshot.into_iter().map(event_to_sse));
     let live = BroadcastStream::new(receiver).filter_map(move |message| {
@@ -77,6 +79,22 @@ pub async fn index_events(
 
     let stream: EventStream = Box::pin(initial.chain(live));
     Ok(Sse::new(stream).keep_alive(KeepAlive::new().interval(Duration::from_secs(15))))
+}
+
+/// `GET /api/v1/index/events` — SSE progress for all running index jobs.
+///
+/// One subscription per client covers navigation between albums and jobs that
+/// were started elsewhere (another tab, a lazy sync, a nested parent job).
+pub async fn all_index_events(State(state): State<AppState>) -> Sse<SseStream> {
+    let hub = state.index_hub();
+    let receiver = hub.subscribe();
+    let snapshots = hub.latest_all();
+
+    let initial = tokio_stream::iter(snapshots.into_iter().map(event_to_sse));
+    let live = BroadcastStream::new(receiver).filter_map(|message| message.ok().map(event_to_sse));
+
+    let stream: EventStream = Box::pin(initial.chain(live));
+    Sse::new(stream).keep_alive(KeepAlive::new().interval(Duration::from_secs(15)))
 }
 
 fn event_to_sse(event: IndexEvent) -> Result<Event, Infallible> {
