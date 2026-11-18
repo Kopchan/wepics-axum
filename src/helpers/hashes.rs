@@ -33,17 +33,13 @@ pub fn album_hash() -> String {
     base62(u128::from_be_bytes(bytes))
 }
 
-/// XXH3-64 of a file's name and contents, encoded in URL-safe Base64.
+/// XXH3-64 of a file's contents, encoded in URL-safe Base64.
 ///
-/// The name is part of the input so two copies of the same file in one album
-/// keep distinct hashes: media URLs are album-scoped, and the client uses the
-/// hash as a list key. Including the contents makes the hash change when a file
-/// is replaced in place.
+/// Only the bytes are hashed, so two copies of the same file get the same
+/// hash regardless of their names. That is what lets the indexer recognise
+/// duplicates: the first copy stays in `media`, the rest go to `duplica`.
 pub fn media_hash(path: &Path) -> std::io::Result<String> {
     let mut hasher = Xxh3::new();
-    if let Some(name) = path.file_name().and_then(|name| name.to_str()) {
-        hasher.update(name.as_bytes());
-    }
 
     let mut file = std::fs::File::open(path)?;
     let mut buffer = vec![0_u8; 64 * 1024];
@@ -104,7 +100,7 @@ mod tests {
     }
 
     #[test]
-    fn media_hash_is_stable_and_depends_on_name_and_contents() {
+    fn media_hash_is_stable_and_depends_only_on_contents() {
         let dir = tempfile::tempdir().unwrap();
         let first = dir.path().join("first.jpg");
         let second = dir.path().join("second.jpg");
@@ -112,9 +108,13 @@ mod tests {
         std::fs::write(&second, b"same").unwrap();
 
         assert_eq!(media_hash(&first).unwrap(), media_hash(&first).unwrap());
-        assert_ne!(media_hash(&first).unwrap(), media_hash(&second).unwrap());
+        assert_eq!(
+            media_hash(&first).unwrap(),
+            media_hash(&second).unwrap(),
+            "identical contents must hash the same under different names"
+        );
 
-        std::fs::write(&first, b"changed").unwrap();
+        std::fs::write(&second, b"changed").unwrap();
         assert_ne!(media_hash(&first).unwrap(), media_hash(&second).unwrap());
     }
 }

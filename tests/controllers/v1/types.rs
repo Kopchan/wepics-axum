@@ -66,6 +66,23 @@ fn random_sort_accepts_seed() {
 }
 
 #[test]
+fn content_sort_accepts_a_media_field() {
+    let sorts = parse_album_sort(Some("-content:date,content:size")).unwrap();
+    assert_eq!(sorts[0].field, AlbumSortField::Content);
+    assert!(sorts[0].descending);
+    assert_eq!(sorts[0].content, Some(MediaSortField::Date));
+    assert_eq!(sorts[1].content, Some(MediaSortField::Size));
+    assert!(!sorts[1].descending);
+
+    // Without a field the legacy first-media-name ordering stays in place.
+    assert_eq!(parse_album_sort(Some("content")).unwrap()[0].content, None);
+    assert_eq!(parse_album_sort(Some("content:")).unwrap()[0].content, None);
+
+    assert!(parse_album_sort(Some("content:random")).is_err());
+    assert!(parse_album_sort(Some("content:bogus")).is_err());
+}
+
+#[test]
 fn media_types_include_vectors_and_ignore_duplicates() {
     assert_eq!(
         parse_media_types(Some("vec,img,VECTOR,svg")).unwrap(),

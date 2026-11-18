@@ -138,8 +138,71 @@ async fn index_sse_reports_progress_and_completion() {
     }
 
     assert!(text.contains("\"done\":true"), "SSE output: {text}");
-    assert!(text.contains("\"new_media\":1"), "SSE output: {text}");
-    assert!(text.contains("\"files_total\":1"), "SSE output: {text}");
+    assert!(text.contains("\"newMedia\":1"), "SSE output: {text}");
+    assert!(text.contains("\"filesTotal\":1"), "SSE output: {text}");
+    assert!(
+        text.contains("\"albumFilesTotal\":1"),
+        "SSE events carry per-album counters: {text}"
+    );
+    assert!(
+        text.contains("\"current\":\"a.jpg\""),
+        "SSE events name the file being hashed: {text}"
+    );
+
+    wait_for_indexed(&state, album.id, Utc::now() - chrono::Duration::seconds(1)).await;
+
+    drop(dir);
+}
+
+#[tokio::test]
+async fn global_index_sse_covers_every_album() {
+    let (dir, state) = setup().await;
+    let album = insert_album(&state.db, "Trip", "trip").await;
+    let album_dir = state.media_dir.join("trip");
+    std::fs::create_dir_all(&album_dir).unwrap();
+    std::fs::write(album_dir.join("b.jpg"), b"b").unwrap();
+
+    let app = app(state.clone());
+
+    // A single subscription, not tied to an album hash.
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/index/events")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert!(
+        response.headers()[header::CONTENT_TYPE]
+            .to_str()
+            .unwrap()
+            .starts_with("text/event-stream")
+    );
+
+    let mut body = response.into_body().into_data_stream();
+
+    // The alias resolves to the same job; the stream is global.
+    let (status, _, _) = send(&app, "/api/v1/album/trip/index?force").await;
+    assert_eq!(status, StatusCode::OK);
+
+    let mut text = String::new();
+    for _ in 0..50 {
+        let next = tokio::time::timeout(Duration::from_secs(3), body.next()).await;
+        let Ok(Some(Ok(chunk))) = next else {
+            break;
+        };
+        text.push_str(&String::from_utf8_lossy(&chunk));
+        if text.contains("\"done\":true") {
+            break;
+        }
+    }
+
+    assert!(text.contains(&album.hash), "SSE output: {text}");
+    assert!(text.contains("\"done\":true"), "SSE output: {text}");
 
     wait_for_indexed(&state, album.id, Utc::now() - chrono::Duration::seconds(1)).await;
 
@@ -261,6 +324,15 @@ async fn sync_indexes_files_and_discovers_child_albums() {
             .collect::<Vec<_>>(),
         vec!["Winter"]
     );
+    let winter_preview = &album["children"][0];
+    assert!(
+        winter_preview.get("indexedAt").is_none(),
+        "an unindexed album must not serialize `indexedAt: null`"
+    );
+    assert!(
+        winter_preview.get("stats").is_none(),
+        "an album with no counters omits `stats` completely"
+    );
 
     // Requesting the child indexes its own folder on demand.
     let winter_since = Utc::now() - chrono::Duration::seconds(1);
@@ -329,6 +401,124 @@ async fn resync_removes_media_that_disappeared() {
             .await
             .unwrap();
     assert_eq!(names, vec!["keep.jpg", "new.png"]);
+
+    drop(dir);
+}
+
+#[tokio::test]
+async fn duplicates_share_one_media_row_and_are_counted() {
+    let (dir, state) = setup().await;
+    let root_id = root_album_id(&state).await;
+    let media_dir = state.media_dir.clone();
+
+    std::fs::write(media_dir.join("original.jpg"), b"same-content").unwrap();
+    std::fs::write(media_dir.join("copy.jpg"), b"same-content").unwrap();
+
+    set_indexed_at(&state, root_id, None).await;
+    let app = app(state.clone());
+    let since = Utc::now() - chrono::Duration::seconds(1);
+    let _ = send(&app, "/api/v1/album/root").await;
+    wait_for_indexed(&state, root_id, since).await;
+
+    // Identical contents keep a single `media` row; the other copy points at it.
+    let media: Vec<(i64, String, String)> =
+        sqlx::query_as("SELECT id, name, hash FROM media WHERE album_id = ?1")
+            .bind(root_id)
+            .fetch_all(&state.db)
+            .await
+            .unwrap();
+    assert_eq!(media.len(), 1, "only the owner stays in media");
+    let (owner_id, owner_name, owner_hash) = &media[0];
+
+    let duplicates: Vec<(String, i64, String)> =
+        sqlx::query_as("SELECT name, media_id, data FROM duplica WHERE album_id = ?1")
+            .bind(root_id)
+            .fetch_all(&state.db)
+            .await
+            .unwrap();
+    assert_eq!(duplicates.len(), 1, "the second copy becomes a duplica");
+    assert_ne!(&duplicates[0].0, owner_name);
+    assert_eq!(duplicates[0].1, *owner_id);
+    let data: serde_json::Value = serde_json::from_str(&duplicates[0].2).unwrap();
+    assert_eq!(data["hash"], owner_hash.as_str());
+
+    let (_, _, body) = send(&app, "/api/v1/album/root?mlimit=10").await;
+    let album = parse_v1(&body);
+    assert_eq!(album["stats"]["direct"]["mediasCount"], 1);
+    assert_eq!(album["stats"]["direct"]["duplicaCount"], 1);
+
+    // Removing the copy drops the row and the counter.
+    std::fs::remove_file(media_dir.join(&duplicates[0].0)).unwrap();
+    let since = Utc::now();
+    let (status, _, _) = send(&app, "/api/v1/album/root/index?force").await;
+    assert_eq!(status, StatusCode::OK);
+    wait_for_indexed(&state, root_id, since).await;
+
+    let left: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM duplica WHERE album_id = ?1")
+        .bind(root_id)
+        .fetch_one(&state.db)
+        .await
+        .unwrap();
+    assert_eq!(left, 0);
+    let (_, _, body) = send(&app, "/api/v1/album/root?mlimit=10").await;
+    let album = parse_v1(&body);
+    assert!(
+        album["stats"]["direct"].get("duplicaCount").is_none(),
+        "a zero duplicate counter is omitted"
+    );
+
+    drop(dir);
+}
+
+#[tokio::test]
+async fn unchanged_files_keep_their_hash_without_reading_content() {
+    let (dir, state) = setup().await;
+    let root_id = root_album_id(&state).await;
+    let path = state.media_dir.join("photo.jpg");
+    std::fs::write(&path, b"first").unwrap();
+    let modified = std::fs::metadata(&path).unwrap().modified().unwrap();
+
+    set_indexed_at(&state, root_id, None).await;
+    let app = app(state.clone());
+    let since = Utc::now() - chrono::Duration::seconds(1);
+    let _ = send(&app, "/api/v1/album/root").await;
+    wait_for_indexed(&state, root_id, since).await;
+
+    let before: String = sqlx::query_scalar("SELECT hash FROM media WHERE album_id = ?1")
+        .bind(root_id)
+        .fetch_one(&state.db)
+        .await
+        .unwrap();
+
+    // Same size, different bytes, original mtime: the file looks untouched, so
+    // its stored hash must be reused instead of hashing the new contents.
+    std::fs::write(&path, b"other").unwrap();
+    std::fs::File::options()
+        .write(true)
+        .open(&path)
+        .unwrap()
+        .set_modified(modified)
+        .unwrap();
+
+    let since = Utc::now();
+    let (status, _, _) = send(&app, "/api/v1/album/root/index?force").await;
+    assert_eq!(status, StatusCode::OK);
+    wait_for_indexed(&state, root_id, since).await;
+
+    let after: String = sqlx::query_scalar("SELECT hash FROM media WHERE album_id = ?1")
+        .bind(root_id)
+        .fetch_one(&state.db)
+        .await
+        .unwrap();
+    assert_eq!(
+        before, after,
+        "name + size + mtime are unchanged, so hashing must be skipped"
+    );
+    assert_ne!(
+        wepics_axum::helpers::hashes::media_hash(&path).unwrap(),
+        after,
+        "the test overwrote the contents, so a real read would change the hash"
+    );
 
     drop(dir);
 }

@@ -154,26 +154,68 @@ pub struct AlbumSort {
     pub descending: bool,
     /// Seed for deterministic `random` sorting.
     pub seed: Option<i64>,
+    /// Media field that supplies the key for `content:<field>`: albums are
+    /// ordered by the value of this field in their first media.
+    pub content: Option<MediaSortField>,
 }
 
 /// Counters for one album. Direct counters cover the album itself, nested ones
 /// cover the whole subtree below it.
+///
+/// Zero counters are omitted from responses: a client that needs a number can
+/// default it to zero, while a payload with a dozen explicit zeros is noise.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AlbumStats {
+    #[serde(skip_serializing_if = "is_zero_i64")]
     pub medias_count: i64,
+    #[serde(skip_serializing_if = "is_zero_i64")]
     pub images_count: i64,
+    #[serde(skip_serializing_if = "is_zero_i64")]
     pub videos_count: i64,
+    #[serde(skip_serializing_if = "is_zero_i64")]
     pub audios_count: i64,
+    #[serde(skip_serializing_if = "is_zero_i64")]
+    pub duplica_count: i64,
+    #[serde(skip_serializing_if = "is_zero_i64")]
     pub albums_count: i64,
+    #[serde(skip_serializing_if = "is_zero_i64")]
     pub size: i64,
+    #[serde(skip_serializing_if = "is_zero_f64")]
     pub duration: f64,
 }
 
+impl AlbumStats {
+    /// `true` when every counter is zero, i.e. the serialized object would be
+    /// empty.
+    fn is_empty(&self) -> bool {
+        *self == Self::default()
+    }
+}
+
+/// `direct` and/or `nested` are omitted when there is nothing to report.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Serialize)]
 pub struct AlbumStatsPair {
+    #[serde(skip_serializing_if = "AlbumStats::is_empty")]
     pub direct: AlbumStats,
+    #[serde(skip_serializing_if = "AlbumStats::is_empty")]
     pub nested: AlbumStats,
+}
+
+impl AlbumStatsPair {
+    /// `true` when both halves are zero, so `stats` itself can be omitted.
+    fn is_empty(&self) -> bool {
+        self.direct.is_empty() && self.nested.is_empty()
+    }
+}
+
+/// Zero values are noise in responses, so serde skips them.
+fn is_zero_i64(value: &i64) -> bool {
+    *value == 0
+}
+
+fn is_zero_f64(value: &f64) -> bool {
+    *value == 0.0
 }
 
 /// An album as returned by `/api/v1/album/{hash}`.
@@ -194,6 +236,7 @@ pub struct AlbumItem {
     pub children: Option<Vec<AlbumItem>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub old_aliases: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "AlbumStatsPair::is_empty")]
     pub stats: AlbumStatsPair,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub order_level: Option<i64>,
@@ -286,7 +329,7 @@ impl AlbumItem {
             children: None,
             old_aliases: parse_old_aliases(&album.old_aliases),
             stats,
-            order_level: Some(album.order_level),
+            order_level: (album.order_level != 0).then_some(album.order_level),
             indexed_at: album.indexed_at,
             created_at: Some(album.created_at),
             content_sort: None,
@@ -553,6 +596,7 @@ pub fn parse_album_sort(raw: Option<&str>) -> Result<Vec<AlbumSort>, AppError> {
             field: AlbumSortField::Name,
             descending: false,
             seed: None,
+            content: None,
         }]);
     };
 
@@ -580,8 +624,9 @@ pub fn parse_album_sort(raw: Option<&str>) -> Result<Vec<AlbumSort>, AppError> {
             "order" | "level" => AlbumSortField::Order,
             other => {
                 return Err(AppError::BadRequest(format!(
-                    "invalid album sort `{other}`, expected name, content, random, size, duration, \
-                     albums, medias, images, videos, audios, created, indexed or order"
+                    "invalid album sort `{other}`, expected name, content[:<media sort>], random, \
+                     size, duration, albums, medias, images, videos, audios, created, indexed or \
+                     order"
                 )));
             }
         };
@@ -590,10 +635,21 @@ pub fn parse_album_sort(raw: Option<&str>) -> Result<Vec<AlbumSort>, AppError> {
         } else {
             None
         };
+        // `content:date` orders albums by the date of their first media;
+        // without a field the first media name is used, as before.
+        let content = if field == AlbumSortField::Content {
+            special
+                .filter(|special| !special.is_empty())
+                .map(parse_content_field)
+                .transpose()?
+        } else {
+            None
+        };
         sorts.push(AlbumSort {
             field,
             descending,
             seed,
+            content,
         });
     }
 
@@ -602,10 +658,35 @@ pub fn parse_album_sort(raw: Option<&str>) -> Result<Vec<AlbumSort>, AppError> {
             field: AlbumSortField::Name,
             descending: false,
             seed: None,
+            content: None,
         });
     }
 
     Ok(sorts)
+}
+
+/// Parses the media field of a `content:<field>` album sort.
+fn parse_content_field(value: &str) -> Result<MediaSortField, AppError> {
+    let field = match value.to_ascii_lowercase().as_str() {
+        "" | "name" => MediaSortField::Name,
+        "date" => MediaSortField::Date,
+        "size" => MediaSortField::Size,
+        "width" => MediaSortField::Width,
+        "height" => MediaSortField::Height,
+        "ratio" => MediaSortField::Ratio,
+        "square" => MediaSortField::Square,
+        "duration" => MediaSortField::Duration,
+        "bitrate" => MediaSortField::Bitrate,
+        "order" => MediaSortField::Order,
+        other => {
+            return Err(AppError::BadRequest(format!(
+                "invalid content sort `{other}`, expected name, date, size, width, height, ratio, \
+                 square, duration, bitrate or order"
+            )));
+        }
+    };
+
+    Ok(field)
 }
 
 fn split_direction(value: &str) -> (bool, &str) {
@@ -714,6 +795,7 @@ struct StatsRow {
     images_count: i64,
     videos_count: i64,
     audios_count: i64,
+    duplica_count: i64,
     albums_count: i64,
     size: i64,
     duration: f64,
@@ -721,6 +803,7 @@ struct StatsRow {
     nested_images_count: i64,
     nested_videos_count: i64,
     nested_audios_count: i64,
+    nested_duplica_count: i64,
     nested_albums_count: i64,
     nested_size: i64,
     nested_duration: f64,
@@ -759,11 +842,12 @@ pub async fn load_album_stats_map(
     );
     builder.push(
         "SELECT s.album_id, s.medias_count, s.images_count, s.videos_count, \
-                s.audios_count, s.albums_count, s.size, s.duration, \
+                s.audios_count, s.duplica_count, s.albums_count, s.size, s.duration, \
                 COALESCE(n.medias_count, 0) AS nested_medias_count, \
                 COALESCE(n.images_count, 0) AS nested_images_count, \
                 COALESCE(n.videos_count, 0) AS nested_videos_count, \
                 COALESCE(n.audios_count, 0) AS nested_audios_count, \
+                COALESCE(n.duplica_count, 0) AS nested_duplica_count, \
                 COALESCE(n.albums_count, 0) AS nested_albums_count, \
                 COALESCE(n.size, 0) AS nested_size, \
                 COALESCE(n.duration, 0.0) AS nested_duration \
@@ -778,6 +862,8 @@ pub async fn load_album_stats_map(
                              ELSE st.videos_count END) AS videos_count, \
                     SUM(CASE WHEN closure.id = closure.root_id THEN 0 \
                              ELSE st.audios_count END) AS audios_count, \
+                    SUM(CASE WHEN closure.id = closure.root_id THEN 0 \
+                             ELSE st.duplica_count END) AS duplica_count, \
                     COUNT(CASE WHEN closure.id = closure.root_id THEN NULL \
                                ELSE 1 END) AS albums_count, \
                     SUM(CASE WHEN closure.id = closure.root_id THEN 0 \
@@ -801,6 +887,7 @@ pub async fn load_album_stats_map(
                     images_count: row.images_count,
                     videos_count: row.videos_count,
                     audios_count: row.audios_count,
+                    duplica_count: row.duplica_count,
                     albums_count: row.albums_count,
                     size: row.size,
                     duration: row.duration,
@@ -810,6 +897,7 @@ pub async fn load_album_stats_map(
                     images_count: row.nested_images_count,
                     videos_count: row.nested_videos_count,
                     audios_count: row.nested_audios_count,
+                    duplica_count: row.nested_duplica_count,
                     albums_count: row.nested_albums_count,
                     size: row.nested_size,
                     duration: row.nested_duration,
@@ -927,6 +1015,84 @@ pub fn push_media_order_exprs(builder: &mut QueryBuilder<Sqlite>, sorts: &[Media
     builder.push(", media.sort_name ASC, media.id ASC");
 }
 
+/// SQL expression for the value a media sort ranks by.
+///
+/// Used to build a `content:<field>` album key and its `contentSort` value.
+fn media_value_sql(field: MediaSortField) -> &'static str {
+    match field {
+        MediaSortField::Name => "media.name",
+        MediaSortField::Date => "media.date",
+        MediaSortField::Size => "media.size",
+        MediaSortField::Width => "media.width",
+        MediaSortField::Height => "media.height",
+        MediaSortField::Ratio => "(CAST(media.width AS REAL) / NULLIF(media.height, 0))",
+        MediaSortField::Square => {
+            "ABS((CAST(MAX(media.width, media.height) AS REAL) \
+             / NULLIF(MIN(media.width, media.height), 0)) - 1)"
+        }
+        MediaSortField::Reacts | MediaSortField::Framerate => "0",
+        MediaSortField::Duration => "media.duration_sec",
+        MediaSortField::Bitrate => {
+            "(CAST(media.size AS REAL) * 8.0 / NULLIF(media.duration_sec, 0))"
+        }
+        MediaSortField::Order => "media.id",
+        MediaSortField::Random => "NULL",
+    }
+}
+
+/// Loads the `contentSort` value of every album in one query.
+///
+/// Only `content:<field>` album sorts produce it: the value is that field of
+/// the album's first media in the same direction the albums are ordered by.
+pub async fn load_content_sort_map(
+    pool: &SqlitePool,
+    album_ids: &[i64],
+    sorts: &[AlbumSort],
+) -> Result<HashMap<i64, String>, AppError> {
+    let Some(sort) = sorts.iter().find(|sort| match sort.content {
+        Some(_) => sort.field == AlbumSortField::Content,
+        None => false,
+    }) else {
+        return Ok(HashMap::new());
+    };
+    let Some(field) = sort.content else {
+        return Ok(HashMap::new());
+    };
+    if album_ids.is_empty() {
+        return Ok(HashMap::new());
+    }
+
+    let mut builder = QueryBuilder::<Sqlite>::new(
+        "SELECT album_id, sort_value FROM (SELECT media.album_id AS album_id, CAST(",
+    );
+    builder.push(media_value_sql(field));
+    builder.push(
+        " AS TEXT) AS sort_value, \
+         ROW_NUMBER() OVER (PARTITION BY media.album_id ORDER BY ",
+    );
+    let media_sort = MediaSort {
+        field,
+        descending: sort.descending,
+        seed: None,
+    };
+    push_media_order_exprs(&mut builder, std::slice::from_ref(&media_sort));
+    builder.push(") AS rn FROM media WHERE media.album_id IN (");
+    push_id_list(&mut builder, album_ids);
+    builder.push(")) WHERE rn = 1 AND sort_value IS NOT NULL");
+
+    let rows: Vec<ContentSortRow> = builder.build_query_as().fetch_all(pool).await?;
+    Ok(rows
+        .into_iter()
+        .map(|row| (row.album_id, row.sort_value))
+        .collect())
+}
+
+#[derive(Debug, FromRow)]
+struct ContentSortRow {
+    album_id: i64,
+    sort_value: String,
+}
+
 /// Appends the `ORDER BY` clause for a child-album query. The query must use
 /// the `albums` table without an alias and join `album_stats`.
 pub fn push_album_order(builder: &mut QueryBuilder<Sqlite>, sorts: &[AlbumSort]) {
@@ -948,14 +1114,32 @@ pub fn push_album_order_exprs(builder: &mut QueryBuilder<Sqlite>, sorts: &[Album
             AlbumSortField::Name => {
                 builder.push("albums.sort_name").push(direction);
             }
-            AlbumSortField::Content => {
-                builder
-                    .push(
-                        "COALESCE((SELECT m.sort_name FROM media m WHERE m.album_id = albums.id \
-                         ORDER BY m.sort_name LIMIT 1), albums.sort_name)",
-                    )
-                    .push(direction);
-            }
+            AlbumSortField::Content => match sort.content {
+                Some(field) => {
+                    // First media of the album in the requested direction; its
+                    // value becomes the album key.
+                    builder
+                        .push("(SELECT ")
+                        .push(media_value_sql(field))
+                        .push(" FROM media WHERE media.album_id = albums.id ORDER BY ");
+                    let media_sort = MediaSort {
+                        field,
+                        descending: sort.descending,
+                        seed: None,
+                    };
+                    push_media_order_exprs(builder, std::slice::from_ref(&media_sort));
+                    builder.push(" LIMIT 1)").push(direction);
+                }
+                None => {
+                    builder
+                        .push(
+                            "COALESCE((SELECT m.sort_name FROM media m \
+                             WHERE m.album_id = albums.id \
+                             ORDER BY m.sort_name LIMIT 1), albums.sort_name)",
+                        )
+                        .push(direction);
+                }
+            },
             AlbumSortField::Random => match sort.seed {
                 Some(seed) => {
                     builder

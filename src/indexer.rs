@@ -6,10 +6,12 @@
 //! whole subtree in one job. `albums.indexed_at` is advanced only after a
 //! successful scan, so a failed sync is retried on the next request.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::time::{Duration as StdDuration, Instant};
 
 use chrono::{DateTime, Duration, Utc};
+use serde::{Deserialize, Serialize};
 use sqlx::SqlitePool;
 
 use crate::helpers::hashes;
@@ -20,12 +22,21 @@ use crate::state::{AppState, is_safe_segment};
 /// How many media rows are written per transaction.
 const INSERT_BATCH: usize = 100;
 
+/// Version of the hash input. Bump this whenever [`hashes::media_hash`] changes
+/// what it hashes: rows written with an older version are re-hashed once instead
+/// of being trusted forever. Migration `0006` defaults existing rows to `0`.
+const MEDIA_HASH_VERSION: i64 = 1;
+
+/// Minimum spacing between progress events while walking files. Large folders
+/// would otherwise flood the broadcast channel with one event per file.
+const PROGRESS_INTERVAL: StdDuration = StdDuration::from_millis(200);
+
 /// An album is re-indexed when its index is older than this.
 const STALE_AFTER_HOURS: i64 = 1;
 
 const UPSERT_MEDIA: &str = r#"
-INSERT INTO media (name, hash, "type", album_id, width, height, size, date, sort_name)
-VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+INSERT INTO media (name, hash, "type", album_id, width, height, size, date, sort_name, hash_version)
+VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
 ON CONFLICT(album_id, name) DO UPDATE SET
     hash = excluded.hash,
     "type" = excluded."type",
@@ -33,14 +44,19 @@ ON CONFLICT(album_id, name) DO UPDATE SET
     height = excluded.height,
     size = excluded.size,
     date = excluded.date,
-    sort_name = excluded.sort_name
-WHERE media.hash <> excluded.hash
-   OR media."type" <> excluded."type"
-   OR media.width <> excluded.width
-   OR media.height <> excluded.height
-   OR media.size <> excluded.size
-   OR media.date IS NOT excluded.date
-   OR media.sort_name <> excluded.sort_name
+    sort_name = excluded.sort_name,
+    hash_version = excluded.hash_version
+RETURNING id
+"#;
+
+const UPSERT_DUPLICA: &str = r#"
+INSERT INTO duplica (name, media_id, album_id, data)
+VALUES (?1, ?2, ?3, ?4)
+ON CONFLICT(album_id, name) DO UPDATE SET
+    media_id = excluded.media_id,
+    data = excluded.data
+WHERE duplica.media_id <> excluded.media_id
+   OR duplica.data <> excluded.data
 "#;
 
 const ALBUM_SELECT: &str = "SELECT id, name, hash, parent_id, path, alias, old_aliases, \
@@ -130,10 +146,10 @@ pub fn start(state: &AppState, album: &Album, options: IndexOptions) -> SyncStar
         };
 
         match result {
-            Ok(()) => progress.publish(&album, IndexPhase::Done, true, None),
+            Ok(()) => progress.finish(&album, IndexPhase::Done, None),
             Err(err) => {
                 eprintln!("sync of album `{}` failed: {err}", album.hash);
-                progress.publish(&album, IndexPhase::Error, true, Some(err.to_string()));
+                progress.finish(&album, IndexPhase::Error, Some(err.to_string()));
             }
         }
     });
@@ -149,8 +165,17 @@ struct Progress {
     files_total: u64,
     dirs_done: u64,
     dirs_total: u64,
+    /// Counters of the album currently being scanned, reset by each `sync_one`.
+    album_files_done: u64,
+    album_files_total: u64,
+    album_dirs_done: u64,
+    album_dirs_total: u64,
     new_albums: u64,
     new_media: u64,
+    /// File or directory being processed right now.
+    current: Option<String>,
+    /// When the last event was published, used to throttle per-file updates.
+    published_at: Instant,
 }
 
 impl Progress {
@@ -163,12 +188,20 @@ impl Progress {
             files_total: 0,
             dirs_done: 0,
             dirs_total: 0,
+            album_files_done: 0,
+            album_files_total: 0,
+            album_dirs_done: 0,
+            album_dirs_total: 0,
             new_albums: 0,
             new_media: 0,
+            current: None,
+            // Allow the first throttled update to go out immediately.
+            published_at: Instant::now() - PROGRESS_INTERVAL,
         }
     }
 
-    fn publish(&self, album: &Album, phase: IndexPhase, done: bool, error: Option<String>) {
+    fn publish(&mut self, album: &Album, phase: IndexPhase, done: bool, error: Option<String>) {
+        self.published_at = Instant::now();
         self.hub.publish(IndexEvent {
             job_id: self.job_id,
             root_hash: self.root_hash.clone(),
@@ -179,11 +212,47 @@ impl Progress {
             files_total: self.files_total,
             dirs_done: self.dirs_done,
             dirs_total: self.dirs_total,
+            album_files_done: self.album_files_done,
+            album_files_total: self.album_files_total,
+            album_dirs_done: self.album_dirs_done,
+            album_dirs_total: self.album_dirs_total,
             new_albums: self.new_albums,
             new_media: self.new_media,
+            current: self.current.clone(),
             done,
             error,
         });
+    }
+
+    /// Publishes at most one event per [`PROGRESS_INTERVAL`], so a folder with
+    /// thousands of files still reports the current name without flooding SSE.
+    fn publish_throttled(&mut self, album: &Album, phase: IndexPhase) {
+        if !self.should_publish() {
+            return;
+        }
+        self.publish(album, phase, false, None);
+    }
+
+    /// Whether the throttle window has passed since the last publish.
+    fn should_publish(&self) -> bool {
+        self.published_at.elapsed() >= PROGRESS_INTERVAL
+    }
+
+    /// Marks one media file as processed for the job and for its album.
+    fn file_done(&mut self) {
+        self.files_done += 1;
+        self.album_files_done += 1;
+    }
+
+    /// Final event; the job counters become the album counters, so a client
+    /// filtering by `album_hash` still sees a consistent summary.
+    fn finish(&mut self, album: &Album, phase: IndexPhase, error: Option<String>) {
+        self.album_files_done = self.files_done;
+        self.album_files_total = self.files_total;
+        self.album_dirs_done = self.dirs_done;
+        self.album_dirs_total = self.dirs_total;
+        self.current = None;
+        self.publish(album, phase, true, error);
     }
 }
 
@@ -201,6 +270,13 @@ async fn sync_one(
         return Err(format!("album `{}` has an unsafe path", album.hash).into());
     };
 
+    // Per-album counters start over with every folder, so a client viewing a
+    // descendant of a nested job sees that album's own bar, not the job total.
+    progress.album_files_done = 0;
+    progress.album_files_total = 0;
+    progress.album_dirs_done = 0;
+    progress.album_dirs_total = 0;
+
     // Listing names is cheap (no per-file `metadata`), so the total is known
     // before the slow part starts and the progress bar can advance smoothly.
     let entries = read_sorted_entries(&dir)
@@ -212,72 +288,153 @@ async fn sync_one(
     // done right away; only the (potentially long) metadata/insert phase is
     // left to report.
     progress.dirs_done += dirs.len() as u64;
+    progress.album_dirs_done += dirs.len() as u64;
+    progress.album_dirs_total = progress.album_dirs_done;
+    progress.album_files_total = media.len() as u64;
 
     if count_totals {
         progress.files_total += media.len() as u64;
         progress.dirs_total += dirs.len() as u64;
-        progress.publish(album, IndexPhase::Scanning, false, None);
     }
+    progress.publish(album, IndexPhase::Scanning, false, None);
 
-    // Snapshot of the current rows: used to count new media and to delete rows
-    // whose files disappeared. The album is claimed exclusively, so a plain
-    // read is enough here.
-    let existing: Vec<(i64, String)> =
-        sqlx::query_as("SELECT id, name FROM media WHERE album_id = ?1")
+    // Totals are known; from here on the bar is determinate and each event
+    // carries the file being hashed, which is what makes slow videos visible.
+    progress.current = media.first().map(|entry| entry.name.clone());
+    progress.publish(album, IndexPhase::Indexing, false, None);
+
+    // Snapshot of the current rows: used to skip hashing unchanged files, to
+    // resolve duplicates and to delete rows whose files disappeared. The album
+    // is claimed exclusively, so a plain read is enough here.
+    let existing: Vec<ExistingMedia> = sqlx::query_as(
+        "SELECT id, name, hash, width, height, size, date, hash_version \
+         FROM media WHERE album_id = ?1",
+    )
+    .bind(album.id)
+    .fetch_all(&state.db)
+    .await
+    .map_err(|err| step("select existing media", err))?;
+
+    let existing_dups: Vec<ExistingDuplica> =
+        sqlx::query_as("SELECT name, media_id, data FROM duplica WHERE album_id = ?1")
             .bind(album.id)
             .fetch_all(&state.db)
             .await
-            .map_err(|err| step("select existing media", err))?;
+            .map_err(|err| step("select existing duplicates", err))?;
 
-    let existing_names: HashSet<&str> = existing.iter().map(|(_, name)| name.as_str()).collect();
+    let existing_by_name: HashMap<&str, &ExistingMedia> = existing
+        .iter()
+        .map(|media| (media.name.as_str(), media))
+        .collect();
+    let existing_dups_by_name: HashMap<&str, (i64, DuplicaData)> = existing_dups
+        .iter()
+        .filter_map(|dup| {
+            let data = serde_json::from_str::<DuplicaData>(&dup.data).ok()?;
+            Some((dup.name.as_str(), (dup.media_id, data)))
+        })
+        .collect();
+
+    let existing_names: HashSet<&str> = existing.iter().map(|row| row.name.as_str()).collect();
+    let existing_dup_names: HashSet<&str> =
+        existing_dups.iter().map(|row| row.name.as_str()).collect();
     let observed: HashSet<&str> = media.iter().map(|entry| entry.name.as_str()).collect();
 
     // Scanning and writing are interleaved: every 100 files are committed in
     // their own transaction while the rest of the folder is still being read.
     // This keeps the write lock free between batches, makes progress visible
     // throughout the scan instead of in one burst at the end, and is safe on
-    // failure because upserts are idempotent (`indexed_at` is only bumped once
-    // everything, including deletions, has landed).
+    // failure because the next scan repairs any half-written state
+    // (`indexed_at` is only bumped once everything, including deletions, has
+    // landed).
     let mut batch: Vec<ScannedFile> = Vec::with_capacity(INSERT_BATCH);
     let mut batch_index = 0_usize;
+    // Content hash -> media row id for every owner written so far. Further
+    // files with the same hash become `duplica` rows pointing at it.
+    let mut hash_owner: HashMap<String, i64> = HashMap::new();
+    let mut seen_hashes: HashSet<String> = HashSet::new();
 
     for entry in &media {
+        progress.current = Some(entry.name.clone());
+
+        // Flush finished rows before announcing the next file, so the wall
+        // picks up new media within one throttle window instead of waiting for
+        // the whole folder (which matters for albums of a few large videos).
+        if progress.should_publish() {
+            if !batch.is_empty() {
+                write_scanned_batch(state, album, &batch, &mut hash_owner, batch_index).await?;
+                batch_index += 1;
+                batch.clear();
+            }
+            progress.publish(album, IndexPhase::Indexing, false, None);
+        }
+
         let metadata = match tokio::fs::metadata(&entry.path).await {
             Ok(metadata) => metadata,
             Err(err) => {
                 eprintln!("skipping `{}`: {err}", entry.path.display());
-                progress.files_done += 1;
+                progress.file_done();
                 continue;
             }
         };
+        let size = i64::try_from(metadata.len()).unwrap_or(i64::MAX);
+        let date = metadata.modified().ok().map(DateTime::<Utc>::from);
 
-        if !existing_names.contains(entry.name.as_str()) {
+        // Reuse the known hash when the file looks untouched. The mtime must be
+        // present: without it, two different files with the same size are
+        // indistinguishable.
+        let known = date.and_then(|date| {
+            known_file(entry, &existing_by_name, &existing_dups_by_name, size, date)
+        });
+
+        let file = match known {
+            Some(known) => ScannedFile {
+                name: entry.name.clone(),
+                hash: known.hash,
+                media_type: entry.media_type,
+                width: known.width,
+                height: known.height,
+                size,
+                date,
+                sort_name: natural_sort_key(&entry.name),
+                known_row: Some(known.row),
+            },
+            None => {
+                let (width, height, hash) = match probe_file(entry).await {
+                    Ok(probed) => probed,
+                    Err(err) => {
+                        eprintln!("skipping `{}`: {err}", entry.path.display());
+                        progress.file_done();
+                        continue;
+                    }
+                };
+                ScannedFile {
+                    name: entry.name.clone(),
+                    hash,
+                    media_type: entry.media_type,
+                    width,
+                    height,
+                    size,
+                    date,
+                    sort_name: natural_sort_key(&entry.name),
+                    known_row: None,
+                }
+            }
+        };
+
+        // The first file with a given content becomes a `media` row; everything
+        // else is a duplicate. Only count genuinely new names as new media.
+        if seen_hashes.insert(file.hash.clone())
+            && !existing_names.contains(entry.name.as_str())
+            && !existing_dup_names.contains(entry.name.as_str())
+        {
             progress.new_media += 1;
         }
 
-        let (width, height, hash) = match probe_file(entry).await {
-            Ok(probed) => probed,
-            Err(err) => {
-                eprintln!("skipping `{}`: {err}", entry.path.display());
-                progress.files_done += 1;
-                continue;
-            }
-        };
-
-        batch.push(ScannedFile {
-            name: entry.name.clone(),
-            hash,
-            media_type: entry.media_type,
-            width,
-            height,
-            size: i64::try_from(metadata.len()).unwrap_or(i64::MAX),
-            date: metadata.modified().ok().map(DateTime::<Utc>::from),
-            sort_name: natural_sort_key(&entry.name),
-        });
-        progress.files_done += 1;
+        batch.push(file);
+        progress.file_done();
 
         if batch.len() >= INSERT_BATCH {
-            write_media_batch(state, album, &batch, batch_index).await?;
+            write_scanned_batch(state, album, &batch, &mut hash_owner, batch_index).await?;
             batch_index += 1;
             batch.clear();
             progress.publish(album, IndexPhase::Indexing, false, None);
@@ -285,7 +442,7 @@ async fn sync_one(
     }
 
     if !batch.is_empty() {
-        write_media_batch(state, album, &batch, batch_index).await?;
+        write_scanned_batch(state, album, &batch, &mut hash_owner, batch_index).await?;
         progress.publish(album, IndexPhase::Indexing, false, None);
     }
 
@@ -297,13 +454,26 @@ async fn sync_one(
             .await
             .map_err(|err| step("begin metadata transaction", err))?;
 
-        for (id, name) in &existing {
-            if !observed.contains(name.as_str()) {
+        for row in &existing {
+            if !observed.contains(row.name.as_str()) {
                 sqlx::query("DELETE FROM media WHERE id = ?1")
-                    .bind(id)
+                    .bind(row.id)
                     .execute(&mut *tx)
                     .await
-                    .map_err(|err| step(&format!("delete `{name}`"), err))?;
+                    .map_err(|err| step(&format!("delete `{}`", row.name), err))?;
+            }
+        }
+
+        // Copies whose files disappeared. Removing their owner above already
+        // cascades the rows that referenced it.
+        for row in &existing_dups {
+            if !observed.contains(row.name.as_str()) {
+                sqlx::query("DELETE FROM duplica WHERE album_id = ?1 AND name = ?2")
+                    .bind(album.id)
+                    .bind(&row.name)
+                    .execute(&mut *tx)
+                    .await
+                    .map_err(|err| step(&format!("delete duplicate `{}`", row.name), err))?;
             }
         }
 
@@ -349,15 +519,24 @@ async fn sync_one(
     };
 
     progress.new_albums += new_albums;
+    progress.current = None;
     progress.publish(album, IndexPhase::Indexing, false, None);
 
     Ok(AlbumSyncStats { children })
 }
 
-async fn write_media_batch(
+/// Writes one scanned batch, deciding which files become `media` rows and
+/// which become `duplica` rows.
+///
+/// The first file with a given content hash becomes the owner; every later file
+/// with the same hash points at it. Files that are already stored exactly as
+/// they were found are not written at all, so re-indexing an unchanged album
+/// does not touch the database rows.
+async fn write_scanned_batch(
     state: &AppState,
     album: &Album,
     batch: &[ScannedFile],
+    hash_owner: &mut HashMap<String, i64>,
     batch_index: usize,
 ) -> IndexResult<()> {
     let write_guard = state.lock_writes().await;
@@ -368,24 +547,102 @@ async fn write_media_batch(
         .map_err(|err| step("begin media batch", err))?;
 
     for file in batch {
-        sqlx::query(UPSERT_MEDIA)
-            .bind(&file.name)
-            .bind(&file.hash)
-            .bind(file.media_type)
-            .bind(album.id)
-            .bind(file.width)
-            .bind(file.height)
-            .bind(file.size)
-            .bind(file.date)
-            .bind(&file.sort_name)
-            .execute(&mut *tx)
-            .await
-            .map_err(|err| {
-                step(
-                    &format!("upsert `{}` (batch {})", file.name, batch_index + 1),
-                    err,
-                )
-            })?;
+        let owner = hash_owner.get(&file.hash).copied();
+
+        match owner {
+            // A later copy of content that is already owned in this album.
+            Some(owner_id) => {
+                let already_stored =
+                    matches!(file.known_row, Some(KnownRow::Duplica(id)) if id == owner_id);
+                if already_stored {
+                    continue;
+                }
+
+                // The name may currently belong to a media row (for example the
+                // file used to hold different content); it becomes a copy now.
+                sqlx::query("DELETE FROM media WHERE album_id = ?1 AND name = ?2")
+                    .bind(album.id)
+                    .bind(&file.name)
+                    .execute(&mut *tx)
+                    .await
+                    .map_err(|err| step(&format!("delete stale media `{}`", file.name), err))?;
+
+                let data = serde_json::to_string(&DuplicaData::from(file))
+                    .map_err(|err| step(&format!("serialize duplicate `{}`", file.name), err))?;
+                sqlx::query(UPSERT_DUPLICA)
+                    .bind(&file.name)
+                    .bind(owner_id)
+                    .bind(album.id)
+                    .bind(data)
+                    .execute(&mut *tx)
+                    .await
+                    .map_err(|err| {
+                        step(
+                            &format!(
+                                "upsert duplicate `{}` (batch {})",
+                                file.name,
+                                batch_index + 1
+                            ),
+                            err,
+                        )
+                    })?;
+            }
+            // The row already holds exactly this content; just remember its id.
+            None => {
+                if let Some(KnownRow::Media(id)) = file.known_row {
+                    hash_owner.insert(file.hash.clone(), id);
+                    continue;
+                }
+
+                // First file with this content in the album: it owns the hash.
+                sqlx::query("DELETE FROM duplica WHERE album_id = ?1 AND name = ?2")
+                    .bind(album.id)
+                    .bind(&file.name)
+                    .execute(&mut *tx)
+                    .await
+                    .map_err(|err| step(&format!("delete duplicate `{}`", file.name), err))?;
+                // Another row may already hold this content under a different
+                // name (for example the previous owner disappeared); only one
+                // `media` row per hash is allowed.
+                sqlx::query("DELETE FROM media WHERE album_id = ?1 AND hash = ?2 AND name <> ?3")
+                    .bind(album.id)
+                    .bind(&file.hash)
+                    .bind(&file.name)
+                    .execute(&mut *tx)
+                    .await
+                    .map_err(|err| {
+                        step(&format!("delete duplicate owner of `{}`", file.name), err)
+                    })?;
+                sqlx::query("DELETE FROM media WHERE album_id = ?1 AND name = ?2 AND hash <> ?3")
+                    .bind(album.id)
+                    .bind(&file.name)
+                    .bind(&file.hash)
+                    .execute(&mut *tx)
+                    .await
+                    .map_err(|err| step(&format!("delete old content of `{}`", file.name), err))?;
+
+                let id: i64 = sqlx::query_scalar(UPSERT_MEDIA)
+                    .bind(&file.name)
+                    .bind(&file.hash)
+                    .bind(file.media_type)
+                    .bind(album.id)
+                    .bind(file.width)
+                    .bind(file.height)
+                    .bind(file.size)
+                    .bind(file.date)
+                    .bind(&file.sort_name)
+                    .bind(MEDIA_HASH_VERSION)
+                    .fetch_one(&mut *tx)
+                    .await
+                    .map_err(|err| {
+                        step(
+                            &format!("upsert `{}` (batch {})", file.name, batch_index + 1),
+                            err,
+                        )
+                    })?;
+                hash_owner.insert(file.hash.clone(), id);
+            }
+        }
     }
 
     tx.commit()
@@ -401,7 +658,7 @@ async fn sync_tree(state: &AppState, album: &Album, progress: &mut Progress) -> 
     };
 
     let canonical = tokio::fs::canonicalize(&dir).await?;
-    let (files_total, dirs_total) = count_tree(&dir).await?;
+    let (files_total, dirs_total) = count_tree(&dir, album, progress).await?;
     progress.files_total = files_total;
     progress.dirs_total = dirs_total;
     progress.publish(album, IndexPhase::Scanning, false, None);
@@ -480,15 +737,27 @@ async fn load_album(pool: &SqlitePool, id: i64) -> IndexResult<Album> {
 /// Counts media files and subdirectories in the whole subtree.
 ///
 /// Symlinks are followed; canonical paths are used to avoid walking in circles.
-async fn count_tree(dir: &Path) -> std::io::Result<(u64, u64)> {
+/// Counts are published while the tree is walked, so the panel shows how many
+/// items were discovered already instead of an empty bar.
+async fn count_tree(
+    dir: &Path,
+    album: &Album,
+    progress: &mut Progress,
+) -> std::io::Result<(u64, u64)> {
     let mut stack = vec![dir.to_path_buf()];
     let mut visited = HashSet::new();
     visited.insert(tokio::fs::canonicalize(dir).await?);
     let mut files = 0_u64;
     let mut dirs = 0_u64;
 
-    while let Some(current) = stack.pop() {
-        let mut read_dir = tokio::fs::read_dir(&current).await?;
+    while let Some(current_dir) = stack.pop() {
+        progress.current = current_dir
+            .file_name()
+            .and_then(|name| name.to_str())
+            .map(str::to_owned);
+        progress.publish_throttled(album, IndexPhase::Scanning);
+
+        let mut read_dir = tokio::fs::read_dir(&current_dir).await?;
 
         while let Some(entry) = read_dir.next_entry().await? {
             let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
@@ -524,10 +793,130 @@ async fn count_tree(dir: &Path) -> std::io::Result<(u64, u64)> {
             } else if metadata.is_file() && media_type_for(&path).is_some() {
                 files += 1;
             }
+
+            // Live discovery counters: `files_total`/`dirs_total` are not final
+            // yet, but the panel can already show the growing totals.
+            progress.files_total = files;
+            progress.dirs_total = dirs;
+            progress.publish_throttled(album, IndexPhase::Scanning);
         }
     }
 
+    progress.files_total = files;
+    progress.dirs_total = dirs;
     Ok((files, dirs))
+}
+
+/// A `media` row loaded before scanning, used to skip hashing and to keep row
+/// ids stable for files whose contents did not change.
+#[derive(Debug, sqlx::FromRow)]
+struct ExistingMedia {
+    id: i64,
+    name: String,
+    hash: String,
+    width: i64,
+    height: i64,
+    size: i64,
+    date: Option<DateTime<Utc>>,
+    hash_version: i64,
+}
+
+/// A `duplica` row loaded before scanning. `media_id` is the owner's row id.
+#[derive(Debug, sqlx::FromRow)]
+struct ExistingDuplica {
+    name: String,
+    media_id: i64,
+    data: String,
+}
+
+/// Serialized into `duplica.data`.
+///
+/// Keeps enough information to skip re-hashing an unchanged copy and to promote
+/// it to a `media` row without re-reading the file (width/height included).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct DuplicaData {
+    hash: String,
+    size: i64,
+    date: Option<DateTime<Utc>>,
+    #[serde(default)]
+    width: i64,
+    #[serde(default)]
+    height: i64,
+    /// Hash input version, see [`MEDIA_HASH_VERSION`].
+    #[serde(default)]
+    version: i64,
+}
+
+impl From<&ScannedFile> for DuplicaData {
+    fn from(file: &ScannedFile) -> Self {
+        Self {
+            hash: file.hash.clone(),
+            size: file.size,
+            date: file.date,
+            width: file.width,
+            height: file.height,
+            version: MEDIA_HASH_VERSION,
+        }
+    }
+}
+
+/// Where a file was found before the scan: a `media` row or a `duplica` row.
+#[derive(Debug, Clone, Copy)]
+enum KnownRow {
+    Media(i64),
+    Duplica(i64),
+}
+
+/// Result of matching a file against its stored row by name, size and mtime.
+struct KnownFile {
+    hash: String,
+    width: i64,
+    height: i64,
+    row: KnownRow,
+}
+
+/// Reuses the stored hash when the file has the same name, size and mtime.
+///
+/// The check is deliberately conservative: a missing mtime or a different hash
+/// algorithm version forces a real read, so changed content is never missed.
+fn known_file(
+    entry: &MediaEntry,
+    existing_by_name: &HashMap<&str, &ExistingMedia>,
+    existing_dups_by_name: &HashMap<&str, (i64, DuplicaData)>,
+    size: i64,
+    date: DateTime<Utc>,
+) -> Option<KnownFile> {
+    if let Some(media) = existing_by_name.get(entry.name.as_str()) {
+        if media.hash_version == MEDIA_HASH_VERSION
+            && media.size == size
+            && same_mtime(media.date, date)
+        {
+            return Some(KnownFile {
+                hash: media.hash.clone(),
+                width: media.width,
+                height: media.height,
+                row: KnownRow::Media(media.id),
+            });
+        }
+        return None;
+    }
+
+    let (media_id, dup) = existing_dups_by_name.get(entry.name.as_str())?;
+    if dup.version == MEDIA_HASH_VERSION && dup.size == size && same_mtime(dup.date, date) {
+        return Some(KnownFile {
+            hash: dup.hash.clone(),
+            width: dup.width,
+            height: dup.height,
+            row: KnownRow::Duplica(*media_id),
+        });
+    }
+    None
+}
+
+/// Compares filesystem timestamps at millisecond precision, the precision
+/// SQLite reliably round-trips.
+fn same_mtime(stored: Option<DateTime<Utc>>, actual: DateTime<Utc>) -> bool {
+    stored.is_some_and(|stored| stored.timestamp_millis() == actual.timestamp_millis())
 }
 
 struct ScannedFile {
@@ -539,6 +928,9 @@ struct ScannedFile {
     size: i64,
     date: Option<DateTime<Utc>>,
     sort_name: String,
+    /// Row this file was recognised as before the scan, if its content did not
+    /// have to be read again.
+    known_row: Option<KnownRow>,
 }
 
 struct ScannedDir {

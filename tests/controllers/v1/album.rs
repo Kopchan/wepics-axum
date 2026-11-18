@@ -101,11 +101,21 @@ async fn album_returns_stats_previews_and_signed_links() {
     assert_eq!(album["hash"], "root");
     assert_eq!(album["stats"]["direct"]["mediasCount"], 6);
     assert_eq!(album["stats"]["direct"]["imagesCount"], 6);
-    assert_eq!(album["stats"]["direct"]["videosCount"], 0);
-    assert_eq!(album["stats"]["direct"]["albumsCount"], 0);
-    assert_eq!(
-        album["stats"]["nested"]["mediasCount"], 0,
-        "nested stats cover sub-albums only"
+    assert!(
+        album["stats"]["direct"].get("videosCount").is_none(),
+        "zero counters are omitted"
+    );
+    assert!(
+        album["stats"]["direct"].get("albumsCount").is_none(),
+        "zero counters are omitted"
+    );
+    assert!(
+        album["stats"].get("nested").is_none(),
+        "an all-zero nested block is omitted; it covers sub-albums only"
+    );
+    assert!(
+        album.get("orderLevel").is_none(),
+        "orderLevel = 0 is omitted"
     );
     assert!(
         album.get("sync").is_none(),
@@ -303,6 +313,87 @@ async fn album_layers_children_sorting_and_ancestors() {
         vec!["root", "Alpha"],
         "ancestors must be ordered from root down"
     );
+
+    drop(dir);
+}
+
+#[tokio::test]
+async fn album_content_sort_uses_the_first_media_value() {
+    let (dir, state) = setup().await;
+    let root_id = root_album_id(&state).await;
+
+    let alpha = insert_child(&state.db, root_id, "Alpha", at(1)).await;
+    let bravo = insert_child(&state.db, root_id, "Bravo", at(1)).await;
+
+    // Alpha's first media by date is older and smaller than Bravo's.
+    for (album_id, prefix, date, size) in [
+        (alpha.id, "a-old", at(1), 10),
+        (alpha.id, "a-new", at(5), 50),
+        (bravo.id, "b-old", at(2), 20),
+        (bravo.id, "b-new", at(9), 90),
+    ] {
+        insert_media(
+            &state.db,
+            album_id,
+            NewMedia {
+                name: &format!("{prefix}.jpg"),
+                hash: prefix,
+                date: Some(date),
+                size,
+            },
+        )
+        .await;
+    }
+
+    let app = app(state.clone());
+
+    // `content:<field>` orders albums by that field of their first media and
+    // reports the value in `contentSort`.
+    let (status, _, body) = send(&app, "/api/v1/album/root?alimit=10&asort=-content:date").await;
+    assert_eq!(status, StatusCode::OK);
+    let album = parse_v1(&body);
+    assert_eq!(v1_names(&album, "children"), vec!["Bravo", "Alpha"]);
+    assert_eq!(
+        album["children"][0]["contentSort"], "2026-01-09T12:00:00+00:00",
+        "the newest media date is shown"
+    );
+    assert_eq!(
+        album["children"][1]["contentSort"],
+        "2026-01-05T12:00:00+00:00"
+    );
+
+    let (status, _, body) = send(&app, "/api/v1/album/root?alimit=10&asort=content:size").await;
+    assert_eq!(status, StatusCode::OK);
+    let album = parse_v1(&body);
+    assert_eq!(
+        v1_names(&album, "children"),
+        vec!["Alpha", "Bravo"],
+        "ascending content:size uses the smallest media of each album"
+    );
+    assert_eq!(album["children"][0]["contentSort"], "10");
+    assert_eq!(album["children"][1]["contentSort"], "20");
+
+    let (status, _, body) = send(&app, "/api/v1/album/root?alimit=10&asort=-content:size").await;
+    assert_eq!(status, StatusCode::OK);
+    let album = parse_v1(&body);
+    assert_eq!(v1_names(&album, "children"), vec!["Bravo", "Alpha"]);
+    assert_eq!(album["children"][0]["contentSort"], "90");
+    assert_eq!(album["children"][1]["contentSort"], "50");
+
+    // Plain `content` keeps the legacy name ordering and exposes no numeric
+    // `contentSort` value for the client to format.
+    let (status, _, body) = send(&app, "/api/v1/album/root?alimit=10&asort=-content").await;
+    assert_eq!(status, StatusCode::OK);
+    let album = parse_v1(&body);
+    assert_eq!(v1_names(&album, "children"), vec!["Bravo", "Alpha"]);
+    assert!(
+        album["children"][0].get("contentSort").is_none(),
+        "a plain content sort has no field to report"
+    );
+
+    // Unknown content fields are rejected instead of silently ignored.
+    let (status, _, _) = send(&app, "/api/v1/album/root?alimit=10&asort=content:random").await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
 
     drop(dir);
 }
