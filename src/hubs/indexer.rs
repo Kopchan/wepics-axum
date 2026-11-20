@@ -39,6 +39,11 @@ pub struct IndexEvent {
     pub album_dirs_total: u64,
     pub new_albums: u64,
     pub new_media: u64,
+    /// Whether this album actually gained, lost or changed rows since the
+    /// previous event of the job. Clients do not refetch unchanged albums, so a
+    /// repeated scan of an untouched folder costs no API requests.
+    #[serde(default)]
+    pub changed: bool,
     /// File or directory the job is working on right now; `None` between steps.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub current: Option<String>,
