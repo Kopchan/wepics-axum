@@ -139,6 +139,8 @@ async fn index_sse_reports_progress_and_completion() {
 
     assert!(text.contains("\"done\":true"), "SSE output: {text}");
     assert!(text.contains("\"newMedia\":1"), "SSE output: {text}");
+    // A first index genuinely changes rows, so clients must refetch.
+    assert!(text.contains("\"changed\":true"), "SSE output: {text}");
     assert!(text.contains("\"filesTotal\":1"), "SSE output: {text}");
     assert!(
         text.contains("\"albumFilesTotal\":1"),
@@ -150,6 +152,64 @@ async fn index_sse_reports_progress_and_completion() {
     );
 
     wait_for_indexed(&state, album.id, Utc::now() - chrono::Duration::seconds(1)).await;
+
+    drop(dir);
+}
+
+#[tokio::test]
+async fn unchanged_rescan_reports_no_changes() {
+    let (dir, state) = setup().await;
+    let album = insert_album(&state.db, "Trip", "trip").await;
+    let album_dir = state.media_dir.join("trip");
+    std::fs::create_dir_all(&album_dir).unwrap();
+    std::fs::write(album_dir.join("a.jpg"), b"a").unwrap();
+
+    let app = app(state.clone());
+
+    let since = Utc::now() - chrono::Duration::seconds(1);
+    let (status, _, _) = send(&app, "/api/v1/album/trip/index?force").await;
+    assert_eq!(status, StatusCode::OK);
+    wait_for_indexed(&state, album.id, since).await;
+    wait_for_media_count(&state, "trip", 1).await;
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/album/trip/index/events")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let mut body = response.into_body().into_data_stream();
+
+    // Nothing on disk changed, so the second pass must not report a change and
+    // the client will not refetch the album or its media.
+    let (status, _, _) = send(&app, "/api/v1/album/trip/index?force").await;
+    assert_eq!(status, StatusCode::OK);
+
+    let mut text = String::new();
+    for _ in 0..50 {
+        let next = tokio::time::timeout(Duration::from_secs(3), body.next()).await;
+        let Ok(Some(Ok(chunk))) = next else {
+            break;
+        };
+        text.push_str(&String::from_utf8_lossy(&chunk));
+        if text.contains("\"done\":true") {
+            break;
+        }
+    }
+
+    assert!(text.contains("\"done\":true"), "SSE output: {text}");
+    assert!(
+        text.contains("\"changed\":false"),
+        "events must carry the change flag: {text}"
+    );
+    assert!(
+        !text.contains("\"changed\":true"),
+        "an untouched album must not report changes: {text}"
+    );
 
     drop(dir);
 }

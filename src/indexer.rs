@@ -172,6 +172,11 @@ struct Progress {
     album_dirs_total: u64,
     new_albums: u64,
     new_media: u64,
+    /// Rows of the album currently being scanned actually changed; reset by each
+    /// `sync_one`, so every event describes only its own album.
+    album_changed: bool,
+    /// Any album of this job changed; reported by the final event.
+    job_changed: bool,
     /// File or directory being processed right now.
     current: Option<String>,
     /// When the last event was published, used to throttle per-file updates.
@@ -194,6 +199,8 @@ impl Progress {
             album_dirs_total: 0,
             new_albums: 0,
             new_media: 0,
+            album_changed: false,
+            job_changed: false,
             current: None,
             // Allow the first throttled update to go out immediately.
             published_at: Instant::now() - PROGRESS_INTERVAL,
@@ -218,6 +225,13 @@ impl Progress {
             album_dirs_total: self.album_dirs_total,
             new_albums: self.new_albums,
             new_media: self.new_media,
+            // A finished job reports its whole subtree, a running one only the
+            // album it is working on.
+            changed: if done {
+                self.job_changed
+            } else {
+                self.album_changed
+            },
             current: self.current.clone(),
             done,
             error,
@@ -231,6 +245,13 @@ impl Progress {
             return;
         }
         self.publish(album, phase, false, None);
+    }
+
+    /// Remembers that the current album's rows really changed, so clients know
+    /// they have something new to fetch.
+    fn mark_changed(&mut self) {
+        self.album_changed = true;
+        self.job_changed = true;
     }
 
     /// Whether the throttle window has passed since the last publish.
@@ -276,6 +297,7 @@ async fn sync_one(
     progress.album_files_total = 0;
     progress.album_dirs_done = 0;
     progress.album_dirs_total = 0;
+    progress.album_changed = false;
 
     // Listing names is cheap (no per-file `metadata`), so the total is known
     // before the slow part starts and the progress bar can advance smoothly.
@@ -361,7 +383,9 @@ async fn sync_one(
         // the whole folder (which matters for albums of a few large videos).
         if progress.should_publish() {
             if !batch.is_empty() {
-                write_scanned_batch(state, album, &batch, &mut hash_owner, batch_index).await?;
+                if write_scanned_batch(state, album, &batch, &mut hash_owner, batch_index).await? {
+                    progress.mark_changed();
+                }
                 batch_index += 1;
                 batch.clear();
             }
@@ -434,7 +458,9 @@ async fn sync_one(
         progress.file_done();
 
         if batch.len() >= INSERT_BATCH {
-            write_scanned_batch(state, album, &batch, &mut hash_owner, batch_index).await?;
+            if write_scanned_batch(state, album, &batch, &mut hash_owner, batch_index).await? {
+                progress.mark_changed();
+            }
             batch_index += 1;
             batch.clear();
             progress.publish(album, IndexPhase::Indexing, false, None);
@@ -442,25 +468,29 @@ async fn sync_one(
     }
 
     if !batch.is_empty() {
-        write_scanned_batch(state, album, &batch, &mut hash_owner, batch_index).await?;
+        if write_scanned_batch(state, album, &batch, &mut hash_owner, batch_index).await? {
+            progress.mark_changed();
+        }
         progress.publish(album, IndexPhase::Indexing, false, None);
     }
 
-    let (children, new_albums) = {
+    let (children, new_albums, deleted) = {
         let _write_guard = state.lock_writes().await;
         let mut tx = state
             .db
             .begin()
             .await
             .map_err(|err| step("begin metadata transaction", err))?;
+        let mut deleted = false;
 
         for row in &existing {
             if !observed.contains(row.name.as_str()) {
-                sqlx::query("DELETE FROM media WHERE id = ?1")
+                let removed = sqlx::query("DELETE FROM media WHERE id = ?1")
                     .bind(row.id)
                     .execute(&mut *tx)
                     .await
                     .map_err(|err| step(&format!("delete `{}`", row.name), err))?;
+                deleted |= removed.rows_affected() > 0;
             }
         }
 
@@ -468,12 +498,13 @@ async fn sync_one(
         // cascades the rows that referenced it.
         for row in &existing_dups {
             if !observed.contains(row.name.as_str()) {
-                sqlx::query("DELETE FROM duplica WHERE album_id = ?1 AND name = ?2")
+                let removed = sqlx::query("DELETE FROM duplica WHERE album_id = ?1 AND name = ?2")
                     .bind(album.id)
                     .bind(&row.name)
                     .execute(&mut *tx)
                     .await
                     .map_err(|err| step(&format!("delete duplicate `{}`", row.name), err))?;
+                deleted |= removed.rows_affected() > 0;
             }
         }
 
@@ -515,9 +546,12 @@ async fn sync_one(
             .await
             .map_err(|err| step("commit metadata transaction", err))?;
 
-        (children, new_albums)
+        (children, new_albums, deleted)
     };
 
+    if new_albums > 0 || deleted {
+        progress.mark_changed();
+    }
     progress.new_albums += new_albums;
     progress.current = None;
     progress.publish(album, IndexPhase::Indexing, false, None);
@@ -538,13 +572,14 @@ async fn write_scanned_batch(
     batch: &[ScannedFile],
     hash_owner: &mut HashMap<String, i64>,
     batch_index: usize,
-) -> IndexResult<()> {
+) -> IndexResult<bool> {
     let write_guard = state.lock_writes().await;
     let mut tx = state
         .db
         .begin()
         .await
         .map_err(|err| step("begin media batch", err))?;
+    let mut written = false;
 
     for file in batch {
         let owner = hash_owner.get(&file.hash).copied();
@@ -586,6 +621,7 @@ async fn write_scanned_batch(
                             err,
                         )
                     })?;
+                written = true;
             }
             // The row already holds exactly this content; just remember its id.
             None => {
@@ -641,6 +677,7 @@ async fn write_scanned_batch(
                         )
                     })?;
                 hash_owner.insert(file.hash.clone(), id);
+                written = true;
             }
         }
     }
@@ -649,7 +686,7 @@ async fn write_scanned_batch(
         .await
         .map_err(|err| step(&format!("commit media batch {}", batch_index + 1), err))?;
     drop(write_guard);
-    Ok(())
+    Ok(written)
 }
 
 async fn sync_tree(state: &AppState, album: &Album, progress: &mut Progress) -> IndexResult<()> {

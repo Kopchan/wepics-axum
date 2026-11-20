@@ -946,10 +946,15 @@ pub fn push_media_order_exprs(builder: &mut QueryBuilder<Sqlite>, sorts: &[Media
                 builder.push("media.sort_name").push(direction);
             }
             MediaSortField::Date => {
-                // Undated files stay last regardless of direction.
-                builder
-                    .push("media.date IS NULL ASC, media.date")
-                    .push(direction);
+                // Undated files stay last regardless of direction. For `DESC`
+                // SQLite already sorts NULLs last, so only `ASC` needs the
+                // explicit term; dropping it lets the `(album_id, date)` index
+                // answer per-album top-N probes without a full sort.
+                if sort.descending {
+                    builder.push("media.date DESC");
+                } else {
+                    builder.push("media.date IS NULL ASC, media.date ASC");
+                }
             }
             MediaSortField::Random => match sort.seed {
                 Some(seed) => {
@@ -1370,6 +1375,93 @@ pub struct MediaPreview<'a> {
     pub exp: i64,
 }
 
+/// Above this many previews per album the nested query ranks the whole
+/// subtree; below it, probing the first rows of every album is much cheaper.
+///
+/// A subtree can hold hundreds of thousands of media, while the response needs
+/// only a handful per viewer. Ranking everything would build a temp B-tree over
+/// every row; probing the first `limit` rows of each album instead touches only
+/// `limit × albums` index entries and ranks that small set.
+const MAX_NESTED_TOP_N: u32 = 32;
+
+/// Pushes the recursive subtree CTE used by nested previews.
+fn push_viewer_tree(builder: &mut QueryBuilder<Sqlite>, viewer_ids: &[i64]) {
+    builder.push(
+        "WITH RECURSIVE tree(root_id, id) AS (SELECT albums.id, albums.id \
+         FROM albums WHERE albums.id IN (",
+    );
+    push_id_list(builder, viewer_ids);
+    builder.push(
+        ") UNION SELECT tree.root_id, albums.id FROM albums JOIN tree \
+         ON albums.parent_id = tree.id) ",
+    );
+}
+
+/// Picks a `media` index that can supply the first sort key, so per-album
+/// top-N probes read the album in order instead of sorting it.
+///
+/// Every index starts with `album_id`, so the probe's `album_id = ?` filter is
+/// still a covering prefix; the index only decides the order of the rest of
+/// the columns. For sorts without a matching index, the plain `album_id` index
+/// is used and rows are sorted in a temp B-tree.
+fn first_sort_index(sorts: &[MediaSort]) -> &'static str {
+    match sorts.first().map(|sort| sort.field) {
+        Some(MediaSortField::Date) => "idx_media_album_date",
+        Some(MediaSortField::Name) => "idx_media_album_sort_name",
+        Some(MediaSortField::Size) => "idx_media_album_size",
+        _ => "idx_media_album_id",
+    }
+}
+
+/// Pushes a nested-preview query that takes the first `limit` media of every
+/// album and only then ranks that small candidate set per viewer.
+fn push_nested_top_n(
+    builder: &mut QueryBuilder<Sqlite>,
+    types: &[MediaType],
+    sorts: &[MediaSort],
+    limit: u32,
+) {
+    // The planner does not always notice that the index can serve the probe's
+    // `ORDER BY` (bundled SQLite 3.51 picks a full album scan instead), so the
+    // index is named explicitly.
+    let index = first_sort_index(sorts);
+    builder.push(", candidates(viewer_id, media_id) AS (");
+    for offset in 0..limit {
+        if offset > 0 {
+            builder.push(" UNION ALL ");
+        }
+        builder.push("SELECT tree.root_id, (SELECT media.id FROM media INDEXED BY ");
+        builder.push(index);
+        builder.push(" WHERE media.album_id = tree.id");
+        push_media_type_filter(builder, types);
+        builder.push(" ORDER BY ");
+        push_media_order_exprs(builder, sorts);
+        builder
+            .push(" LIMIT 1 OFFSET ")
+            .push_bind(i64::from(offset));
+        builder.push(") FROM tree");
+    }
+    builder.push(
+        "), ranked AS (SELECT media.id AS media_id, \
+         candidates.viewer_id AS viewer_id, \
+         ROW_NUMBER() OVER (PARTITION BY candidates.viewer_id ORDER BY ",
+    );
+    push_media_order_exprs(builder, sorts);
+    builder.push(
+        ") AS rn FROM candidates JOIN media ON media.id = candidates.media_id) \
+         SELECT ",
+    );
+    builder.push(MEDIA_COLUMNS);
+    builder.push(
+        ", ranked.viewer_id AS viewer_id, ranked.rn AS rn \
+         FROM ranked JOIN media ON media.id = ranked.media_id \
+         JOIN albums ON albums.id = media.album_id \
+         WHERE ranked.rn <= ",
+    );
+    builder.push_bind(i64::from(limit));
+    builder.push(" ORDER BY ranked.viewer_id, ranked.rn");
+}
+
 /// Loads media previews for every viewer album in one query.
 ///
 /// With `nested == false` each viewer gets its own media, capped per album by
@@ -1390,28 +1482,31 @@ pub async fn load_media_previews(
 
     let mut builder = QueryBuilder::<Sqlite>::new("");
     if preview.nested {
-        builder.push(
-            "WITH RECURSIVE tree(root_id, id) AS (SELECT albums.id, albums.id \
-             FROM albums WHERE albums.id IN (",
-        );
-        push_id_list(&mut builder, viewer_ids);
-        builder.push(
-            ") UNION SELECT tree.root_id, albums.id FROM albums JOIN tree \
-             ON albums.parent_id = tree.id) ",
-        );
-        builder.push("SELECT * FROM (SELECT ");
-        builder.push(MEDIA_COLUMNS);
-        builder.push(
-            ", tree.root_id AS viewer_id, \
-             ROW_NUMBER() OVER (PARTITION BY tree.root_id ORDER BY ",
-        );
-        push_media_order_exprs(&mut builder, preview.sorts);
-        builder.push(
-            ") AS rn FROM tree \
-             JOIN media ON media.album_id = tree.id \
-             JOIN albums ON albums.id = media.album_id \
-             WHERE 1 = 1",
-        );
+        push_viewer_tree(&mut builder, viewer_ids);
+        match preview.limit.filter(|limit| *limit <= MAX_NESTED_TOP_N) {
+            Some(limit) => push_nested_top_n(&mut builder, preview.types, preview.sorts, limit),
+            None => {
+                builder.push("SELECT * FROM (SELECT ");
+                builder.push(MEDIA_COLUMNS);
+                builder.push(
+                    ", tree.root_id AS viewer_id, \
+                     ROW_NUMBER() OVER (PARTITION BY tree.root_id ORDER BY ",
+                );
+                push_media_order_exprs(&mut builder, preview.sorts);
+                builder.push(
+                    ") AS rn FROM tree \
+                     JOIN media ON media.album_id = tree.id \
+                     JOIN albums ON albums.id = media.album_id \
+                     WHERE 1 = 1",
+                );
+                push_media_type_filter(&mut builder, preview.types);
+                builder.push(")");
+                if let Some(limit) = preview.limit {
+                    builder.push(" WHERE rn <= ").push_bind(i64::from(limit));
+                }
+                builder.push(" ORDER BY viewer_id, rn");
+            }
+        }
     } else {
         builder.push("SELECT * FROM (SELECT ");
         builder.push(MEDIA_COLUMNS);
@@ -1424,13 +1519,13 @@ pub async fn load_media_previews(
         builder.push(" WHERE media.album_id IN (");
         push_id_list(&mut builder, viewer_ids);
         builder.push(")");
+        push_media_type_filter(&mut builder, preview.types);
+        builder.push(")");
+        if let Some(limit) = preview.limit {
+            builder.push(" WHERE rn <= ").push_bind(i64::from(limit));
+        }
+        builder.push(" ORDER BY viewer_id, rn");
     }
-    push_media_type_filter(&mut builder, preview.types);
-    builder.push(")");
-    if let Some(limit) = preview.limit {
-        builder.push(" WHERE rn <= ").push_bind(i64::from(limit));
-    }
-    builder.push(" ORDER BY viewer_id, rn");
 
     let rows: Vec<MediaRow> = builder.build_query_as().fetch_all(&state.db).await?;
     for row in rows {
