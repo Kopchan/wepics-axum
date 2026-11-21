@@ -7,25 +7,32 @@ use axum::http::header::CACHE_CONTROL;
 use axum::middleware::{self, Next};
 use axum::response::Response;
 use axum::routing::get;
+use tower_http::compression::CompressionLayer;
 use tower_http::services::ServeDir;
 
 use crate::controllers;
 use crate::cors;
 use crate::state::AppState;
 
-/// Frontend assets are served without content hashes, so a cached copy would
-/// keep running old JavaScript after an update. `no-cache` still allows cheap
-/// `304 Not Modified` revalidation via the `ETag`/`Last-Modified` headers.
+/// Hashed build assets never change under the same URL, so they can be cached
+/// forever; everything else in the shell is revalidated so an update is picked
+/// up on the next load. `no-cache` still allows cheap `304 Not Modified`
+/// revalidation via the `ETag`/`Last-Modified` headers.
 async fn revalidate_static(req: Request, next: Next) -> Response {
     let path = req.uri().path().to_owned();
     let mut response = next.run(req).await;
 
     // Media (`/file`, `/files`, `/thumb`) is immutable content and API
-    // responses are dynamic; only the shell and its assets need revalidation.
+    // responses are dynamic; only the shell and its assets need caching rules.
     if !(path.starts_with("/api") || path.starts_with("/file") || path.starts_with("/thumb")) {
-        response
-            .headers_mut()
-            .insert(CACHE_CONTROL, HeaderValue::from_static("no-cache"));
+        let cache_control = if path.starts_with("/assets/") || path.starts_with("/public/assets/")
+        {
+            // Vite puts a content hash in every file name under `assets/`.
+            HeaderValue::from_static("public, max-age=31536000, immutable")
+        } else {
+            HeaderValue::from_static("no-cache")
+        };
+        response.headers_mut().insert(CACHE_CONTROL, cache_control);
     }
 
     response
@@ -57,5 +64,8 @@ pub fn app(state: AppState) -> Router {
         .fallback_service(static_files)
         .layer(cors::layer())
         .layer(middleware::from_fn(revalidate_static))
+        // Text responses (JS/CSS/JSON/HTML) are compressed; images, media
+        // ranges and SSE are skipped by the default predicate.
+        .layer(CompressionLayer::new())
         .with_state(state)
 }

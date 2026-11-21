@@ -54,14 +54,13 @@ pub async fn spa(State(state): State<AppState>, request: Request) -> Result<Resp
     {
         return Err(AppError::NotFound);
     }
+    if !is_bot(request.headers()) {
+        return serve_index().await;
+    }
 
     let hash = path.trim_matches('/');
     if hash.is_empty() || hash.contains('/') {
         return Ok(not_found_page());
-    }
-
-    if !is_bot(request.headers()) {
-        return serve_index().await;
     }
 
     let album = match resolve_album(&state, hash).await {

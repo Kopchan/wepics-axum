@@ -28,7 +28,13 @@ sqlx = { version = "0.9", default-features = false, features = [
 tokio = { version = "1", features = ["full"] }
 tokio-stream = { version = "0.1", features = ["sync"] }
 tower = { version = "0.5", features = ["util"] }
-tower-http = { version = "0.7.1", features = ["cors", "set-header", "fs"] }
+tower-http = { version = "0.7.1", features = [
+    "cors",
+    "set-header",
+    "fs",
+    "compression-br",
+    "compression-gzip",
+] }
 xxhash-rust = { version = "0.8", features = ["xxh3"] }
 
 [dev-dependencies]

@@ -10,7 +10,10 @@ use crate::error::AppError;
 pub const ALLOWED_SIZES: [u32; 6] = [144, 240, 360, 480, 720, 1080];
 
 /// WebP encoder settings applied to every preview.
-pub const WEBP_SUFFIX: &str = ".webp[Q=82]";
+pub const WEBP_SUFFIX: &str = ".webp[Q=90]";
+
+/// Upper limit 
+const UNCONSTRAINED: u32 = 10_000_000;
 
 /// Parses `w480` / `q240`; sizes between the allowed steps are snapped up,
 /// matching Laravel's redirect behaviour without an extra round-trip.
@@ -88,14 +91,8 @@ fn known_dimensions(source: &Path, width: i64, height: i64) -> Result<(u32, u32)
 /// previews never upscale.
 pub fn target_box(direction: char, size: u32, width: u32, height: u32) -> (u32, u32) {
     match direction {
-        'w' => {
-            let target = size.min(width);
-            (target, scaled(height, target, width))
-        }
-        'h' => {
-            let target = size.min(height);
-            (scaled(width, target, height), target)
-        }
+        'w' => (size.min(width), UNCONSTRAINED),
+        'h' => (UNCONSTRAINED, size.min(height)),
         // Square preview: cover the box, then crop it in the centre.
         _ => {
             let shorter = width.min(height).max(1);
