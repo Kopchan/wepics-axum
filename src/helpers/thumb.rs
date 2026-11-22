@@ -54,7 +54,7 @@ pub fn render(
     source_width: i64,
     source_height: i64,
 ) -> Result<Vec<u8>, String> {
-    crate::helpers::vips::ensure()?;
+    crate::config::vips::ensure()?;
 
     let (source_width, source_height) = known_dimensions(source, source_width, source_height)?;
     let (width, height) = target_box(direction, size, source_width, source_height);

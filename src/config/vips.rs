@@ -14,7 +14,7 @@ pub fn ensure() -> Result<(), String> {
     STATE
         .get_or_init(|| {
             vips::init(Some("wepics-axum"))
-                .map_err(|err| format!("cannot initialize libvips: {err}"))?;
+                .map_err(|err| format!("Failed initialize libvips: {err}"))?;
             tune();
             Ok(())
         })

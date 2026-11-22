@@ -1127,7 +1127,7 @@ fn probe_dimensions(path: &Path, media_type: MediaType) -> (i64, i64) {
 /// Vector dimensions through libvips. SVG is rendered lazily, so this only
 /// parses the document and reports its intrinsic size.
 fn vips_dimensions(path: &Path) -> Option<(usize, usize)> {
-    crate::helpers::vips::ensure().ok()?;
+    crate::config::vips::ensure().ok()?;
     let image = vips::VipsImage::from_file(path).ok()?;
     Some((image.width() as usize, image.height() as usize))
 }
