@@ -38,9 +38,33 @@ tower-http = { version = "0.7.1", features = [
 xxhash-rust = { version = "0.8", features = ["xxh3"] }
 
 [dev-dependencies]
+tempfile = "3"
 image = { version = "0.25", default-features = false, features = [
     "jpeg",
     "png",
     "webp",
 ] }
-tempfile = "3"
+
+[target.'cfg(target_os = "windows")'.build-dependencies]
+ico = "0.3"
+image = { version = "0.25", default-features = false, features = ["png"] }
+winresource = "0.1"
+
+[package.metadata.packager]
+product-name = "Wepics Server"
+identifier = "com.wepics.wepicserv"
+icons = [
+    "public/icon/app.ico",
+    "public/icon/app24.png",
+    "public/icon/app32.png",
+    "public/icon/app48.png",
+    "public/icon/app64.png",
+    "public/icon/app96.png",
+    "public/icon/app128.png",
+    "public/icon/app192.png",
+    "public/icon/app256.png",
+    "public/icon/app512.png"
+]
+
+[package.metadata.packager.nsis]
+installer-icon = "public/icon/app.ico"

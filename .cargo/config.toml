@@ -1,6 +1,6 @@
 [alias]
 dev = "run"
-release = "run --release"
+prod = "run --release"
+package = "packager --release"
 check-all = "check --all-targets"
-test-all = "test --all"
 lint = "clippy --all-targets --all-features -- -D warnings"
