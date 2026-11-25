@@ -34,6 +34,12 @@ dist:
   @just build
   @just package
 
+# Build release + installer with the default data folder baked in:
+#   just dist-data wepics-data
+dist-data dir:
+  cargo build --release --config 'env.WEPICS_DATA_DIR="{{dir}}"'
+  cargo packager --release
+
 # Check main code for compilation errors
 check:
   cargo check

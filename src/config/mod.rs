@@ -21,7 +21,7 @@
 //!
 //! | Variable | Meaning | Default |
 //! | --- | --- | --- |
-//! | `DATA_DIR` | root for everything the server writes | `data` |
+//! | `DATA_DIR` | root for everything the server writes | `data`, baked at build time via `WEPICS_DATA_DIR` |
 //! | `DATABASE_URL` | full SQLite URL, overrides `DATABASE_FILE` | — |
 //! | `DATABASE_FILE` | SQLite file | `{DATA_DIR}/database/wepics.db` |
 //! | `MEDIA_DIR` | photo/video library | `{DATA_DIR}/media` |
@@ -43,7 +43,21 @@ pub mod vips;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 
-const DEFAULT_DATA_DIR: &str = "data";
+/// Root for everything the server writes when `DATA_DIR` is not set.
+///
+/// The value is baked in at build time, so a branded/portable build can ship
+/// with its own folder without any runtime configuration:
+///
+/// ```text
+/// cargo build --release --config 'env.WEPICS_DATA_DIR="wepics-data"'
+/// ```
+///
+/// A relative value is still resolved against the working directory (or the
+/// executable's directory in an installed layout), exactly like `DATA_DIR`.
+pub const DEFAULT_DATA_DIR: &str = match option_env!("WEPICS_DATA_DIR") {
+    Some(dir) => dir,
+    None => "data",
+};
 const DEFAULT_PUBLIC_DIR: &str = "public";
 const DEFAULT_BIND_ATTEMPTS: u16 = 100;
 
@@ -225,20 +239,22 @@ mod tests {
     #[test]
     fn defaults_share_one_data_root() {
         let config = AppConfig::defaults();
+        let root = PathBuf::from(DEFAULT_DATA_DIR);
 
-        assert_eq!(config.media_dir, PathBuf::from("data").join("media"));
-        assert_eq!(config.cache_dir, PathBuf::from("data").join("cache"));
+        assert_eq!(config.data_dir, root);
+        assert_eq!(config.media_dir, root.join("media"));
+        assert_eq!(config.cache_dir, root.join("cache"));
         assert_eq!(
             config.database_file,
-            PathBuf::from("data").join("database").join("wepics.db")
+            root.join("database").join("wepics.db")
         );
         assert_eq!(
             config.compressed_public_dir(),
-            PathBuf::from("data").join("cache").join("public")
+            root.join("cache").join("public")
         );
         assert_eq!(
             config.default_tls_cert(),
-            PathBuf::from("data").join("cert").join("cert.pem")
+            root.join("cert").join("cert.pem")
         );
     }
 
