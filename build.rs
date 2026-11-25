@@ -30,7 +30,6 @@ fn link_vips_msvc() {
     }
 }
 
-
 #[cfg(not(target_os = "windows"))]
 fn embed_windows_icon() {}
 
@@ -44,12 +43,12 @@ fn embed_windows_icon() {
 
     for size in sizes {
         let png_path = format!("public/icon/app{}.png", size);
-        if Path::new(&png_path).exists() {
-            if let Ok(img) = image::open(&png_path) {
-                let rgba = img.into_rgba8();
-                let icon_image = ico::IconImage::from_rgba_data(size, size, rgba.into_raw());
-                icon_dir.add_entry(ico::IconDirEntry::encode(&icon_image).unwrap());
-            }
+        if Path::new(&png_path).exists()
+            && let Ok(img) = image::open(&png_path)
+        {
+            let rgba = img.into_rgba8();
+            let icon_image = ico::IconImage::from_rgba_data(size, size, rgba.into_raw());
+            icon_dir.add_entry(ico::IconDirEntry::encode(&icon_image).unwrap());
         }
     }
 

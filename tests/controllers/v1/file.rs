@@ -23,7 +23,7 @@ async fn files_are_served_with_inline_disposition_and_caching() {
     )
     .await;
 
-    let album_dir = state.media_dir.join(&album.hash);
+    let album_dir = state.config.media_dir.join(&album.hash);
     std::fs::create_dir_all(&album_dir).unwrap();
     std::fs::write(album_dir.join(&media.name), b"jpegdata").unwrap();
 
@@ -88,7 +88,7 @@ async fn root_album_files_live_directly_in_media_dir() {
         },
     )
     .await;
-    std::fs::write(state.media_dir.join(&media.name), b"png").unwrap();
+    std::fs::write(state.config.media_dir.join(&media.name), b"png").unwrap();
 
     let query = link(&state, ROOT_ALBUM_HASH, "h2");
     let (status, _, body) = send(&app, &format!("/file/v1/root/h2?{query}")).await;
@@ -114,7 +114,7 @@ async fn files_support_range_requests_and_head() {
     )
     .await;
 
-    let album_dir = state.media_dir.join(&album.hash);
+    let album_dir = state.config.media_dir.join(&album.hash);
     std::fs::create_dir_all(&album_dir).unwrap();
     std::fs::write(album_dir.join(&media.name), b"jpegdata").unwrap();
 
@@ -192,7 +192,7 @@ async fn files_require_a_valid_signature() {
         },
     )
     .await;
-    std::fs::write(state.media_dir.join("photo.png"), b"data").unwrap();
+    std::fs::write(state.config.media_dir.join("photo.png"), b"data").unwrap();
 
     let app = app(state.clone());
     let exp = chrono::Utc::now().timestamp() + 3600;

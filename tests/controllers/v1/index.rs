@@ -18,7 +18,7 @@ use wepics_axum::models::{Album, Media, MediaType};
 async fn manual_index_honours_force_and_bare_flags() {
     let (dir, state) = setup().await;
     let album = insert_album(&state.db, "Trip", "trip").await;
-    let album_dir = state.media_dir.join("trip");
+    let album_dir = state.config.media_dir.join("trip");
     std::fs::create_dir_all(&album_dir).unwrap();
     std::fs::write(album_dir.join("a.jpg"), b"a").unwrap();
     set_indexed_at(&state, album.id, Some(Utc::now())).await;
@@ -60,7 +60,7 @@ async fn manual_index_honours_force_and_bare_flags() {
 async fn nested_index_walks_descendants() {
     let (dir, state) = setup().await;
     let root = insert_album(&state.db, "Trip", "trip").await;
-    let root_dir = state.media_dir.join("trip");
+    let root_dir = state.config.media_dir.join("trip");
     let winter_dir = root_dir.join("winter");
     let deep_dir = winter_dir.join("deep");
     std::fs::create_dir_all(&deep_dir).unwrap();
@@ -96,7 +96,7 @@ async fn nested_index_walks_descendants() {
 async fn index_sse_reports_progress_and_completion() {
     let (dir, state) = setup().await;
     let album = insert_album(&state.db, "Trip", "trip").await;
-    let album_dir = state.media_dir.join("trip");
+    let album_dir = state.config.media_dir.join("trip");
     std::fs::create_dir_all(&album_dir).unwrap();
     std::fs::write(album_dir.join("a.jpg"), b"a").unwrap();
 
@@ -160,7 +160,7 @@ async fn index_sse_reports_progress_and_completion() {
 async fn unchanged_rescan_reports_no_changes() {
     let (dir, state) = setup().await;
     let album = insert_album(&state.db, "Trip", "trip").await;
-    let album_dir = state.media_dir.join("trip");
+    let album_dir = state.config.media_dir.join("trip");
     std::fs::create_dir_all(&album_dir).unwrap();
     std::fs::write(album_dir.join("a.jpg"), b"a").unwrap();
 
@@ -218,7 +218,7 @@ async fn unchanged_rescan_reports_no_changes() {
 async fn global_index_sse_covers_every_album() {
     let (dir, state) = setup().await;
     let album = insert_album(&state.db, "Trip", "trip").await;
-    let album_dir = state.media_dir.join("trip");
+    let album_dir = state.config.media_dir.join("trip");
     std::fs::create_dir_all(&album_dir).unwrap();
     std::fs::write(album_dir.join("b.jpg"), b"b").unwrap();
 
@@ -273,7 +273,7 @@ async fn global_index_sse_covers_every_album() {
 async fn sync_indexes_files_and_discovers_child_albums() {
     let (dir, state) = setup().await;
     let root_id = root_album_id(&state).await;
-    let media_dir = state.media_dir.clone();
+    let media_dir = state.config.media_dir.clone();
 
     std::fs::write(media_dir.join("photo10.jpg"), b"0123456789").unwrap();
     std::fs::write(media_dir.join("photo2.png"), b"png").unwrap();
@@ -434,7 +434,7 @@ async fn sync_indexes_files_and_discovers_child_albums() {
 async fn resync_removes_media_that_disappeared() {
     let (dir, state) = setup().await;
     let root_id = root_album_id(&state).await;
-    let media_dir = state.media_dir.clone();
+    let media_dir = state.config.media_dir.clone();
 
     std::fs::write(media_dir.join("keep.jpg"), b"keep").unwrap();
     std::fs::write(media_dir.join("drop.jpg"), b"drop").unwrap();
@@ -469,7 +469,7 @@ async fn resync_removes_media_that_disappeared() {
 async fn duplicates_share_one_media_row_and_are_counted() {
     let (dir, state) = setup().await;
     let root_id = root_album_id(&state).await;
-    let media_dir = state.media_dir.clone();
+    let media_dir = state.config.media_dir.clone();
 
     std::fs::write(media_dir.join("original.jpg"), b"same-content").unwrap();
     std::fs::write(media_dir.join("copy.jpg"), b"same-content").unwrap();
@@ -534,7 +534,7 @@ async fn duplicates_share_one_media_row_and_are_counted() {
 async fn unchanged_files_keep_their_hash_without_reading_content() {
     let (dir, state) = setup().await;
     let root_id = root_album_id(&state).await;
-    let path = state.media_dir.join("photo.jpg");
+    let path = state.config.media_dir.join("photo.jpg");
     std::fs::write(&path, b"first").unwrap();
     let modified = std::fs::metadata(&path).unwrap().modified().unwrap();
 
@@ -590,7 +590,7 @@ async fn symlinked_album_directory_is_indexed() {
     std::fs::create_dir_all(&target).unwrap();
     std::fs::write(target.join("photo.jpg"), b"x").unwrap();
 
-    let link_path = state.media_dir.join("Moe");
+    let link_path = state.config.media_dir.join("Moe");
     if !create_dir_link(&link_path, &target) {
         eprintln!("skipping symlink test: cannot create directory link");
         return;
@@ -642,9 +642,9 @@ async fn indexing_stores_image_and_vector_dimensions() {
     let (dir, state) = setup().await;
     let root_id = root_album_id(&state).await;
 
-    crate::common::write_png(&state.media_dir.join("tiny.png"), 40, 20);
+    crate::common::write_png(&state.config.media_dir.join("tiny.png"), 40, 20);
     std::fs::write(
-        state.media_dir.join("logo.svg"),
+        state.config.media_dir.join("logo.svg"),
         br#"<svg xmlns="http://www.w3.org/2000/svg" width="120" height="80"></svg>"#,
     )
     .unwrap();

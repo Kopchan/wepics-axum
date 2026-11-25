@@ -1,13 +1,12 @@
 //! HTML entry point: the SPA shell for people, server-side OG tags for bots.
 
-use std::path::PathBuf;
-
 use axum::body::Body;
 use axum::extract::{Request, State};
 use axum::http::header::{CACHE_CONTROL, CONTENT_TYPE, HOST, USER_AGENT};
 use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use axum::response::Response;
 
+use crate::config::AppConfig;
 use crate::error::AppError;
 use crate::helpers::secure_link;
 use crate::models::{Album, ROOT_ALBUM_HASH};
@@ -17,20 +16,13 @@ use crate::state::AppState;
 const SITE_NAME: &str = "wepics";
 const DEFAULT_DESCRIPTION: &str = "Фотографии и видео, собранные в альбомы.";
 
-/// Directory with the static frontend (JS, CSS, favicon, fonts).
-pub(crate) fn public_dir() -> PathBuf {
-    std::env::var_os("PUBLIC_DIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("public"))
-}
-
 /// `GET /` — the SPA for people, a page with OG tags for bots.
 pub async fn root_page(
     State(state): State<AppState>,
     headers: HeaderMap,
 ) -> Result<Response, AppError> {
     if !is_bot(&headers) {
-        return serve_index().await;
+        return serve_index(&state).await;
     }
 
     let album = match resolve_album(&state, ROOT_ALBUM_HASH).await {
@@ -55,7 +47,7 @@ pub async fn spa(State(state): State<AppState>, request: Request) -> Result<Resp
         return Err(AppError::NotFound);
     }
     if !is_bot(request.headers()) {
-        return serve_index().await;
+        return serve_index(&state).await;
     }
 
     let hash = path.trim_matches('/');
@@ -72,8 +64,8 @@ pub async fn spa(State(state): State<AppState>, request: Request) -> Result<Resp
     render_bot_page(&state, &album, request.headers()).await
 }
 
-async fn serve_index() -> Result<Response, AppError> {
-    let html = tokio::fs::read_to_string(public_dir().join("index.html")).await?;
+async fn serve_index(state: &AppState) -> Result<Response, AppError> {
+    let html = tokio::fs::read_to_string(state.config.public_dir.join("index.html")).await?;
     Ok(html_response(html, StatusCode::OK))
 }
 
@@ -82,7 +74,7 @@ async fn render_bot_page(
     album: &Album,
     headers: &HeaderMap,
 ) -> Result<Response, AppError> {
-    let base = base_url(headers);
+    let base = base_url(&state.config, headers);
     let is_root = album.hash == ROOT_ALBUM_HASH;
 
     let image: Option<(String, i64, i64)> = sqlx::query_as(
@@ -132,7 +124,7 @@ async fn render_bot_page(
     });
 
     let meta = social_meta(&title, &description, &url, image.as_ref(), &album.name);
-    let index = tokio::fs::read_to_string(public_dir().join("index.html")).await?;
+    let index = tokio::fs::read_to_string(state.config.public_dir.join("index.html")).await?;
 
     Ok(html_response(
         inject_meta(&index, &title, &meta),
@@ -268,12 +260,9 @@ fn is_bot(headers: &HeaderMap) -> bool {
     .any(|needle| user_agent.contains(needle))
 }
 
-fn base_url(headers: &HeaderMap) -> String {
-    if let Ok(value) = std::env::var("PUBLIC_URL") {
-        let value = value.trim_end_matches('/');
-        if !value.is_empty() {
-            return value.to_owned();
-        }
+fn base_url(config: &AppConfig, headers: &HeaderMap) -> String {
+    if let Some(url) = &config.public_url {
+        return url.clone();
     }
 
     let scheme = headers

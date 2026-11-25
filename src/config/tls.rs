@@ -1,35 +1,53 @@
 use axum_server::tls_rustls::RustlsConfig;
-use std::path::PathBuf;
+use std::path::Path;
 
-pub async fn load_or_generate(
-  cert_env: Option<String>,
-  key_env: Option<String>,
-) -> Result<RustlsConfig, Box<dyn std::error::Error>> {
-  if let (Some(cert), Some(key)) = (cert_env, key_env) {
-    println!("TLS: loading certificate from {cert}");
-    return Ok(RustlsConfig::from_pem_file(cert, key).await?);
-  }
+use super::AppConfig;
 
-  let cert_dir = PathBuf::from("data/cert");
-  let cert_path = cert_dir.join("cert.pem");
-  let key_path = cert_dir.join("key.pem");
+/// Loads the configured certificate pair, generating a self-signed one at the
+/// default location when it is missing.
+///
+/// Paths come from [`AppConfig::tls_paths`]: custom `TLS_CERT`/`TLS_KEY` are
+/// used only when both files exist; otherwise the pair under
+/// `data/cert/{cert,key}.pem` is used and generated on first start.
+pub async fn load(cfg: &AppConfig) -> Result<RustlsConfig, Box<dyn std::error::Error>> {
+    if cfg.tls_custom_paths_missing() {
+        eprintln!(
+            "TLS: TLS_CERT/TLS_KEY are set but not readable, falling back to {}",
+            cfg.default_tls_cert().display()
+        );
+    }
 
-  if cert_path.exists() && key_path.exists() {
-    println!("TLS: loading existing certificate from {}", cert_dir.display());
-    return Ok(RustlsConfig::from_pem_file(cert_path, key_path).await?);
-  }
+    let (cert_path, key_path) = cfg.tls_paths();
 
-  println!("TLS: generating self-signed certificate in {}...", cert_dir.display());
-  tokio::fs::create_dir_all(&cert_dir).await?;
+    if cert_path.is_file() && key_path.is_file() {
+        println!("TLS: loading certificate from {}", cert_path.display());
+        return Ok(RustlsConfig::from_pem_file(&cert_path, &key_path).await?);
+    }
 
-  let subject_alt_names = vec!["localhost".to_string(), "127.0.0.1".to_string()];
-  let certified_key = rcgen::generate_simple_self_signed(subject_alt_names)?;
+    if let Some(dir) = cert_path.parent() {
+        tokio::fs::create_dir_all(dir).await?;
+    }
+    println!(
+        "TLS: generating self-signed certificate in {}",
+        parent(&cert_path).display()
+    );
 
-  let cert_pem = certified_key.cert.pem();
-  let key_pem = certified_key.key_pair.serialize_pem();
+    let subject_alt_names = vec![
+        "localhost".to_string(),
+        "127.0.0.1".to_string(),
+        "::1".to_string(),
+    ];
+    let certified_key = rcgen::generate_simple_self_signed(subject_alt_names)?;
 
-  tokio::fs::write(&cert_path, &cert_pem).await?;
-  tokio::fs::write(&key_path, &key_pem).await?;
+    let cert_pem = certified_key.cert.pem();
+    let key_pem = certified_key.key_pair.serialize_pem();
 
-  Ok(RustlsConfig::from_pem(cert_pem.into_bytes(), key_pem.into_bytes()).await?)
+    tokio::fs::write(&cert_path, &cert_pem).await?;
+    tokio::fs::write(&key_path, &key_pem).await?;
+
+    Ok(RustlsConfig::from_pem(cert_pem.into_bytes(), key_pem.into_bytes()).await?)
+}
+
+fn parent(path: &Path) -> &Path {
+    path.parent().unwrap_or(path)
 }

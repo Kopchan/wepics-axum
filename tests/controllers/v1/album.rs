@@ -12,7 +12,7 @@ use wepics_axum::models::{MediaType, ROOT_ALBUM_HASH};
 #[tokio::test]
 async fn root_album_is_created_at_startup() {
     let (dir, state) = setup().await;
-    let media_dir = state.media_dir.clone();
+    let media_dir = state.config.media_dir.clone();
     let pool = state.db.clone();
     let app = app(state);
 
@@ -53,7 +53,7 @@ async fn requests_never_create_the_root_album() {
         .await
         .unwrap();
     assert_eq!(albums, 0, "requests must not create albums");
-    assert!(!state.media_dir.exists());
+    assert!(!state.config.media_dir.exists());
 
     // Startup is the only place that bootstraps storage.
     state.initialize().await.unwrap();

@@ -7,6 +7,7 @@
 
 use std::path::Path;
 use std::str::FromStr;
+use std::sync::Arc;
 
 use axum::Router;
 use axum::body::Body;
@@ -17,6 +18,7 @@ use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
 use tempfile::TempDir;
 use tower::ServiceExt;
 
+use wepics_axum::config::AppConfig;
 use wepics_axum::models::{Album, Media, MediaType, ROOT_ALBUM_HASH, natural_sort_key};
 use wepics_axum::routes;
 use wepics_axum::state::AppState;
@@ -52,7 +54,11 @@ pub async fn setup_raw() -> (TempDir, AppState) {
     let dir = workspace_tempdir();
     let pool = test_pool().await;
 
-    let state = AppState::new(pool, dir.path().join("media"), dir.path().join("cache"));
+    let mut config = AppConfig::defaults();
+    config.media_dir = dir.path().join("media");
+    config.cache_dir = dir.path().join("cache");
+
+    let state = AppState::new(pool, Arc::new(config));
     (dir, state)
 }
 

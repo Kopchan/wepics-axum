@@ -6,6 +6,7 @@ use std::time::Duration;
 use sqlx::SqlitePool;
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions};
 
+use crate::config::AppConfig;
 use crate::helpers::secure_link;
 use crate::hubs::indexer::IndexHub;
 use crate::hubs::sync_tracker::{SyncGuard, SyncTracker};
@@ -16,11 +17,8 @@ use crate::models::{Album, Media, ROOT_ALBUM_HASH};
 #[derive(Clone)]
 pub struct AppState {
     pub db: SqlitePool,
-    /// Storage root, `./data/media` by default.
-    pub media_dir: PathBuf,
-    /// Generated artifacts, `./data/cache` by default. Kept outside the media
-    /// tree so previews can never be indexed as albums or media.
-    pub cache_dir: PathBuf,
+    /// All runtime settings. Cheap to clone, shared by every request.
+    pub config: Arc<AppConfig>,
     /// Per-process secret for media link signatures.
     secret: Arc<[u8; 32]>,
     /// Albums with a background indexing task in flight.
@@ -34,15 +32,10 @@ pub struct AppState {
 }
 
 impl AppState {
-    pub fn new(
-        db: SqlitePool,
-        media_dir: impl Into<PathBuf>,
-        cache_dir: impl Into<PathBuf>,
-    ) -> Self {
+    pub fn new(db: SqlitePool, config: Arc<AppConfig>) -> Self {
         Self {
             db,
-            media_dir: media_dir.into(),
-            cache_dir: cache_dir.into(),
+            config,
             secret: Arc::new(random_secret()),
             write_gate: Arc::new(tokio::sync::Mutex::new(())),
             syncing: SyncTracker::default(),
@@ -53,22 +46,23 @@ impl AppState {
 
     /// Opens the database, creating the file if needed, then applies migrations
     /// and bootstraps the storage (root album + media directory).
-    pub async fn connect(
-        database_url: &str,
-        media_dir: impl Into<PathBuf>,
-        cache_dir: impl Into<PathBuf>,
-    ) -> Result<Self, Box<dyn std::error::Error>> {
-        let options = SqliteConnectOptions::from_str(database_url)?
-            .create_if_missing(true)
-            // SQLite does not enforce FKs unless asked to.
-            .foreign_keys(true)
-            // Background album syncs used to collide on the rollback journal.
-            .journal_mode(SqliteJournalMode::Wal)
-            // Every upsert opens a statement journal. On this Windows setup
-            // creating those temp files eventually fails with
-            // `(code: 14) unable to open database file`, so keep them in RAM.
-            .pragma("temp_store", "MEMORY")
-            .busy_timeout(Duration::from_secs(30));
+    pub async fn connect(config: Arc<AppConfig>) -> Result<Self, Box<dyn std::error::Error>> {
+        // A URL can specify modes and pragmas, but it also needs escaping for
+        // Windows paths, so the default path is passed as a plain filename.
+        let options = match config.database_url.as_deref() {
+            Some(url) => SqliteConnectOptions::from_str(url)?,
+            None => SqliteConnectOptions::new().filename(&config.database_file),
+        }
+        .create_if_missing(true)
+        // SQLite does not enforce FKs unless asked to.
+        .foreign_keys(true)
+        // Background album syncs used to collide on the rollback journal.
+        .journal_mode(SqliteJournalMode::Wal)
+        // Every upsert opens a statement journal. On this Windows setup
+        // creating those temp files eventually fails with
+        // `(code: 14) unable to open database file`, so keep them in RAM.
+        .pragma("temp_store", "MEMORY")
+        .busy_timeout(Duration::from_secs(30));
 
         // `create_if_missing` creates the file, not its parent directory.
         if let Some(parent) = options.get_filename().parent()
@@ -84,7 +78,7 @@ impl AppState {
 
         sqlx::migrate!("./migrations").run(&db).await?;
 
-        let state = Self::new(db, media_dir, cache_dir);
+        let state = Self::new(db, config);
         state.initialize().await?;
         Ok(state)
     }
@@ -92,7 +86,7 @@ impl AppState {
     /// Startup-only bootstrap: makes sure the media directory and the root
     /// album row exist. Requests never create them.
     pub async fn initialize(&self) -> Result<(), Box<dyn std::error::Error>> {
-        tokio::fs::create_dir_all(&self.media_dir).await?;
+        tokio::fs::create_dir_all(&self.config.media_dir).await?;
         // Previews live in the cache root, never inside the media tree, so the
         // indexer cannot mistake them for albums or media.
         tokio::fs::create_dir_all(self.thumb_dir()).await?;
@@ -109,7 +103,7 @@ impl AppState {
 
     /// Root directory for generated previews.
     pub fn thumb_dir(&self) -> PathBuf {
-        self.cache_dir.join("thumbs").join("v1")
+        self.config.thumb_dir()
     }
 
     /// Short-lived signature for `/thumb/v1` and `/file/v1`.
@@ -134,7 +128,7 @@ impl AppState {
     /// The root album has an empty [`Album::path`]; every other album maps to a
     /// subdirectory. Returns `None` if any path segment is unsafe.
     pub fn album_dir(&self, album: &Album) -> Option<PathBuf> {
-        let mut dir = self.media_dir.clone();
+        let mut dir = self.config.media_dir.clone();
 
         for segment in album.path.split('/').filter(|segment| !segment.is_empty()) {
             if !is_safe_segment(segment) {

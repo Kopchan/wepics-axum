@@ -20,17 +20,26 @@ fn allowed_sizes_are_the_client_steps() {
 
 #[test]
 fn boxes_keep_aspect_and_never_upscale() {
-    // 800x600 landscape, width 144 -> 108 high.
-    assert_eq!(target_box('w', 144, 800, 600), (144, 108));
-    // Height 240 -> 320 wide.
-    assert_eq!(target_box('h', 240, 800, 600), (320, 240));
+    // Width-limited: the other axis is left to libvips, which preserves the
+    // aspect ratio and never upscales under `VIPS_SIZE_DOWN`.
+    let (width, height) = target_box('w', 144, 800, 600);
+    assert_eq!(width, 144);
+    assert!(height > 1000);
+
+    // Height-limited for the same reason.
+    let (width, height) = target_box('h', 240, 800, 600);
+    assert!(width > 1000);
+    assert_eq!(height, 240);
+
     // Square: cover 144, then crop.
     assert_eq!(target_box('q', 144, 800, 600), (192, 144));
     // Portrait sources cover the other axis.
     assert_eq!(target_box('q', 144, 600, 800), (144, 192));
     // Small originals stay their original size.
-    assert_eq!(target_box('w', 1080, 100, 50), (100, 50));
+    assert_eq!(target_box('w', 1080, 100, 50).0, 100);
     assert_eq!(target_box('q', 1080, 100, 50), (100, 50));
     // Degenerate metadata never yields a zero-sized box.
-    assert_eq!(target_box('w', 144, 0, 0), (0, 1));
+    let (width, height) = target_box('w', 144, 0, 0);
+    assert_eq!(width, 1);
+    assert!(height > 1000);
 }

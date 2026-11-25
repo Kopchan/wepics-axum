@@ -12,6 +12,7 @@ use tower_http::services::ServeDir;
 
 use crate::controllers;
 use crate::cors;
+use crate::layers::static_cache::{StaticCompressionCache, compress_and_cache_static};
 use crate::state::AppState;
 
 /// Hashed build assets never change under the same URL, so they can be cached
@@ -22,25 +23,37 @@ async fn revalidate_static(req: Request, next: Next) -> Response {
     let path = req.uri().path().to_owned();
     let mut response = next.run(req).await;
 
-    // Media (`/file`, `/files`, `/thumb`) is immutable content and API
-    // responses are dynamic; only the shell and its assets need caching rules.
-    if !(path.starts_with("/api") || path.starts_with("/file") || path.starts_with("/thumb")) {
-        let cache_control = if path.starts_with("/assets/") || path.starts_with("/public/assets/")
-        {
-            // Vite puts a content hash in every file name under `assets/`.
-            HeaderValue::from_static("public, max-age=31536000, immutable")
-        } else {
-            HeaderValue::from_static("no-cache")
-        };
-        response.headers_mut().insert(CACHE_CONTROL, cache_control);
+    // API/media responses have their own policy. Errors and redirects must not
+    // be cached as immutable; 304 keeps whatever the previous response had and
+    // still benefits from the same header below.
+    if response.status().is_client_error()
+        || response.status().is_server_error()
+        || path.starts_with("/api")
+        || path.starts_with("/file")
+        || path.starts_with("/thumb")
+    {
+        return response;
     }
 
+    let is_immutable = path.starts_with("/assets/")
+        || path.starts_with("/public/assets/")
+        || path == "/favicon.ico"
+        || path == "/public/favicon.ico";
+
+    let cache_control = if is_immutable {
+        HeaderValue::from_static("public, max-age=31536000, immutable")
+    } else {
+        HeaderValue::from_static("no-cache")
+    };
+
+    response.headers_mut().insert(CACHE_CONTROL, cache_control);
     response
 }
 
 /// Full application: static frontend, SPA/SSR pages, API, files and CORS.
 pub fn app(state: AppState) -> Router {
-    let public_dir = controllers::public_dir();
+    let public_dir = state.config.public_dir.clone();
+    let static_cache = StaticCompressionCache::from_config(&state.config);
     let spa = get(controllers::spa).with_state(state.clone());
 
     // `fallback` keeps the status of the SPA response (200), unlike
@@ -62,6 +75,10 @@ pub fn app(state: AppState) -> Router {
         .nest("/file/v1", v1::files::router())
         .nest("/thumb/v1", v1::thumb::router())
         .fallback_service(static_files)
+        .layer(middleware::from_fn_with_state(
+            static_cache,
+            compress_and_cache_static,
+        ))
         .layer(cors::layer())
         .layer(middleware::from_fn(revalidate_static))
         // Text responses (JS/CSS/JSON/HTML) are compressed; images, media

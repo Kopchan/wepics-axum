@@ -21,6 +21,11 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 xxhash-rust = { version = "0.8", features = ["xxh3"] }
 sha2 = "0.10"
+dashmap = "6.1"
+brotli = "7.0"
+flate2 = "1.0"
+httpdate = "1"
+mime_guess = "2"
 sqlx = { version = "0.9", default-features = false, features = [
     "runtime-tokio",
     "sqlite",
@@ -55,6 +60,9 @@ winresource = "0.1"
 [package.metadata.packager]
 product-name = "Wepics Server"
 identifier = "com.wepics.wepicserv"
+# The installer copies these next to the binary. `PUBLIC_DIR` then resolves to
+# `public` beside the executable, together with the `data` root.
+resources = [{ src = "public", target = "public" }]
 icons = [
     "public/icon/app.ico",
     "public/icon/app24.png",

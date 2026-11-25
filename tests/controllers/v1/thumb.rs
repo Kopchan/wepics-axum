@@ -13,7 +13,7 @@ async fn previews_are_resized_encoded_and_cached() {
     let (dir, state) = setup().await;
     let root_id = root_album_id(&state).await;
 
-    let source = state.media_dir.join("photo.png");
+    let source = state.config.media_dir.join("photo.png");
     write_png(&source, 800, 600);
     insert_media(
         &state.db,
@@ -43,7 +43,7 @@ async fn previews_are_resized_encoded_and_cached() {
     let cached = state.thumb_dir().join("w144").join("media1.webp");
     assert!(cached.is_file(), "generated previews are cached");
     assert!(
-        !state.media_dir.join(".thumbs").exists(),
+        !state.config.media_dir.join(".thumbs").exists(),
         "the media tree stays free of generated files"
     );
 
@@ -72,7 +72,7 @@ async fn previews_require_a_valid_signature() {
     let (dir, state) = setup().await;
     let root_id = root_album_id(&state).await;
 
-    write_png(&state.media_dir.join("photo.png"), 80, 60);
+    write_png(&state.config.media_dir.join("photo.png"), 80, 60);
     insert_media(
         &state.db,
         root_id,
@@ -134,7 +134,7 @@ async fn vector_previews_are_rendered() {
     let (dir, state) = setup().await;
     let root_id = root_album_id(&state).await;
 
-    let svg = state.media_dir.join("logo.svg");
+    let svg = state.config.media_dir.join("logo.svg");
     std::fs::write(
         &svg,
         r##"<svg xmlns="http://www.w3.org/2000/svg" width="400" height="200">
@@ -183,7 +183,7 @@ async fn video_previews_are_rejected() {
         10,
     )
     .await;
-    std::fs::write(state.media_dir.join("clip.mp4"), b"mp4").unwrap();
+    std::fs::write(state.config.media_dir.join("clip.mp4"), b"mp4").unwrap();
 
     let app = app(state.clone());
     let query = link(&state, "root", "vid");
