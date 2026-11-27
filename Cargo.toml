@@ -57,8 +57,13 @@ ico = "0.3"
 image = { version = "0.25", default-features = false, features = ["png"] }
 winresource = "0.1"
 
+[package.metadata.winresource]
+ProductName = "Wepics Server"
+FileDescription = "Wepics Server — Media Gallery"
+
 [package.metadata.packager]
 product-name = "Wepics Server"
+description = "Wepics Server — Media Gallery"
 identifier = "com.wepics.wepicserv"
 # The installer copies these next to the binary. `PUBLIC_DIR` then resolves to
 # `public` beside the executable, together with the `data` root.

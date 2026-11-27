@@ -27,10 +27,11 @@ prod:
 [arg('data_dir', long='data-dir')]
 build data_dir="":
   {{ if data_dir != "" { 
-  "cargo build --release --config 'env.WEPICS_DATA_DIR=\"" + data_dir + "\"'" 
+    "cargo build --release --config 'env.WEPICS_DATA_DIR=\\\"" + data_dir + "\\\"'" 
   } else { 
-  "cargo build --release" 
+    "cargo build --release" 
   } }}
+
 
 # Package the installer
 [group: 'Build & Distribution']
@@ -40,7 +41,7 @@ package:
 # Build release binary and package the installer
 [group: 'Build & Distribution']
 [arg('data_dir', long='data-dir')]
-dist data_dir="wepics-data": (build data_dir) package
+dist data_dir="": (build data_dir) package
 
 
 # --- Code Quality & Testing ---
@@ -132,7 +133,7 @@ setup-dev: setup-rust setup-media-handlers setup-audit-tools setup-packager
 [group: 'Environment']
 setup-media-handlers: setup-image-handler setup-video-handler
 
-# Install image handler (libVIPS) for thumbnailing  static pictures
+# Install image handler (libVIPS) for thumbnailing static pictures
 [group: 'Environment']
 setup-image-handler: _setup-image-handler
 
@@ -215,62 +216,51 @@ _setup-video-handler:
 [unix]
 [private]
 _doctor-media:
-  #!/usr/bin/env bash
-  set -euo pipefail
-  ok=true
-  for cmd in vips ffmpeg ffprobe; do
-  if command -v "$cmd" >/dev/null 2>&1; then
-  ver=$("$cmd" -version 2>&1 | head -n 1)
-  printf "  \033[32m✓\033[0m %-10s %s\n" "$cmd" "$ver"
-  else
-  printf "  \033[31m✗\033[0m %-10s NOT FOUND\n" "$cmd"
-  ok=false
-  fi
-  done
-  $ok
+    #!/usr/bin/env bash
+    for cmd in vips ffmpeg ffprobe; do
+        if command -v "$cmd" >/dev/null 2>&1; then
+            ver=$("$cmd" --version 2>&1 | head -n 1)
+            printf "  \033[32m✓\033[0m %-15s %s\n" "$cmd" "$ver"
+        else
+            printf "  \033[31m✗\033[0m %-15s NOT FOUND\n" "$cmd"
+        fi
+    done
 
 [windows]
 [private]
 _doctor-media:
-  @foreach ($cmd in @('vips', 'ffmpeg', 'ffprobe')) { \
-  if (Get-Command $cmd -ErrorAction SilentlyContinue) { \
-  $ver = (& $cmd -version 2>&1 | Select-Object -First 1); \
-  Write-Host "  [OK] $($cmd.PadRight(10)) $ver" -ForegroundColor Green \
-  } else { \
-  Write-Host "  [MISSING] $($cmd.PadRight(10)) NOT FOUND" -ForegroundColor Red; \
-  $script:failed = $true \
-  } \
-  }; if ($script:failed) { exit 1 }
-
+    @foreach ($cmd in @('vips', 'ffmpeg', 'ffprobe')) { \
+        if (Get-Command $cmd -ErrorAction SilentlyContinue) { \
+            $ver = (& $cmd --version 2>&1 | Select-Object -First 1); \
+            Write-Host "  [OK]      $($cmd.PadRight(15)) $ver" -ForegroundColor Green \
+        } else { \
+            Write-Host "  [MISSING] $($cmd.PadRight(15)) NOT FOUND" -ForegroundColor Red \
+        } \
+    }
 
 # --- Dev tools check (OS-specific) ---
 
 [unix]
 [private]
 _doctor-dev:
-  #!/usr/bin/env bash
-  set -euo pipefail
-  ok=true
-  for cmd in rustc cargo cargo-packager; do
-  if command -v "$cmd" >/dev/null 2>&1; then
-  ver=$("$cmd" --version 2>&1 | head -n 1)
-  printf "  \033[32m✓\033[0m %-15s %s\n" "$cmd" "$ver"
-  else
-  printf "  \033[31m✗\033[0m %-15s NOT FOUND\n" "$cmd"
-  ok=false
-  fi
-  done
-  $ok
+    #!/usr/bin/env bash
+    for cmd in rustc cargo cargo-packager; do
+        if command -v "$cmd" >/dev/null 2>&1; then
+            ver=$("$cmd" --version 2>&1 | head -n 1)
+            printf "  \033[32m✓\033[0m %-15s %s\n" "$cmd" "$ver"
+        else
+            printf "  \033[31m✗\033[0m %-15s NOT FOUND\n" "$cmd"
+        fi
+    done
 
 [windows]
 [private]
 _doctor-dev:
-  @foreach ($cmd in @('rustc', 'cargo', 'cargo-packager')) { \
-  if (Get-Command $cmd -ErrorAction SilentlyContinue) { \
-  $ver = (& $cmd --version 2>&1 | Select-Object -First 1); \
-  Write-Host "  [OK] $($cmd.PadRight(15)) $ver" -ForegroundColor Green \
-  } else { \
-  Write-Host "  [MISSING] $($cmd.PadRight(15)) NOT FOUND" -ForegroundColor Red; \
-  $script:failed = $true \
-  } \
-  }; if ($script:failed) { exit 1 }
+    @foreach ($cmd in @('rustc', 'cargo', 'cargo-packager')) { \
+        if (Get-Command $cmd -ErrorAction SilentlyContinue) { \
+            $ver = (& $cmd --version 2>&1 | Select-Object -First 1); \
+            Write-Host "  [OK]      $($cmd.PadRight(15)) $ver" -ForegroundColor Green \
+        } else { \
+            Write-Host "  [MISSING] $($cmd.PadRight(15)) NOT FOUND" -ForegroundColor Red \
+        } \
+    }

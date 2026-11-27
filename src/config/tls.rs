@@ -12,7 +12,7 @@ use super::AppConfig;
 pub async fn load(cfg: &AppConfig) -> Result<RustlsConfig, Box<dyn std::error::Error>> {
     if cfg.tls_custom_paths_missing() {
         eprintln!(
-            "TLS: TLS_CERT/TLS_KEY are set but not readable, falling back to {}",
+            "TLS:      TLS_CERT/TLS_KEY are set but not readable, falling back to {}",
             cfg.default_tls_cert().display()
         );
     }
@@ -20,7 +20,7 @@ pub async fn load(cfg: &AppConfig) -> Result<RustlsConfig, Box<dyn std::error::E
     let (cert_path, key_path) = cfg.tls_paths();
 
     if cert_path.is_file() && key_path.is_file() {
-        println!("TLS: loading certificate from {}", cert_path.display());
+        println!("TLS:      loading certificate from {}", cert_path.display());
         return Ok(RustlsConfig::from_pem_file(&cert_path, &key_path).await?);
     }
 
@@ -28,7 +28,7 @@ pub async fn load(cfg: &AppConfig) -> Result<RustlsConfig, Box<dyn std::error::E
         tokio::fs::create_dir_all(dir).await?;
     }
     println!(
-        "TLS: generating self-signed certificate in {}",
+        "TLS:      generating self-signed certificate in {}",
         parent(&cert_path).display()
     );
 

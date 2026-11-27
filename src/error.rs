@@ -66,7 +66,7 @@ impl IntoResponse for AppError {
             AppError::BadRequest(message) => (StatusCode::BAD_REQUEST, message),
             AppError::Forbidden(message) => (StatusCode::FORBIDDEN, message),
             AppError::Internal(message) => {
-                eprintln!("internal error: {message}");
+                eprintln!("ERR: internal error: {message}");
                 (
                     StatusCode::INTERNAL_SERVER_ERROR,
                     "internal server error".to_string(),
@@ -74,14 +74,14 @@ impl IntoResponse for AppError {
             }
             // Internal details stay in logs, not in the response.
             AppError::Database(err) => {
-                eprintln!("database error: {err}");
+                eprintln!("ERR: database error: {err}");
                 (
                     StatusCode::INTERNAL_SERVER_ERROR,
                     "internal server error".to_string(),
                 )
             }
             AppError::Io(err) => {
-                eprintln!("io error: {err}");
+                eprintln!("ERR: io error: {err}");
                 (
                     StatusCode::INTERNAL_SERVER_ERROR,
                     "internal server error".to_string(),

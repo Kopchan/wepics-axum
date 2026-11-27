@@ -155,11 +155,11 @@ impl StaticCompressionCache {
             {
                 Ok(Ok(())) => {}
                 Ok(Err(err)) => {
-                    eprintln!("static cache: {}: {err}", destination.display());
+                    eprintln!("ERR: static cache: {}: {err}", destination.display());
                     return None;
                 }
                 Err(err) => {
-                    eprintln!("static cache: {}: {err}", destination.display());
+                    eprintln!("ERR: static cache: {}: {err}", destination.display());
                     return None;
                 }
             }
@@ -200,7 +200,7 @@ fn walk_and_compress(public_dir: &Path, compressed_dir: &Path) -> std::io::Resul
 
     if !public_dir.is_dir() {
         eprintln!(
-            "static cache: {} is missing, nothing to precompress",
+            "INFO: static cache: {} is missing, nothing to precompress",
             public_dir.display()
         );
         return Ok(0);
@@ -213,7 +213,7 @@ fn walk_and_compress(public_dir: &Path, compressed_dir: &Path) -> std::io::Resul
         let entries = match std::fs::read_dir(&dir) {
             Ok(entries) => entries,
             Err(err) => {
-                eprintln!("static cache: {}: {err}", dir.display());
+                eprintln!("ERR: static cache: {}: {err}", dir.display());
                 continue;
             }
         };
@@ -222,7 +222,7 @@ fn walk_and_compress(public_dir: &Path, compressed_dir: &Path) -> std::io::Resul
             let entry = match entry {
                 Ok(entry) => entry,
                 Err(err) => {
-                    eprintln!("static cache: {}: {err}", dir.display());
+                    eprintln!("ERR: static cache: {}: {err}", dir.display());
                     continue;
                 }
             };
@@ -230,7 +230,7 @@ fn walk_and_compress(public_dir: &Path, compressed_dir: &Path) -> std::io::Resul
             let file_type = match entry.file_type() {
                 Ok(file_type) => file_type,
                 Err(err) => {
-                    eprintln!("static cache: {}: {err}", path.display());
+                    eprintln!("ERR: static cache: {}: {err}", path.display());
                     continue;
                 }
             };
@@ -267,7 +267,7 @@ fn walk_and_compress(public_dir: &Path, compressed_dir: &Path) -> std::io::Resul
                 }
                 match compress_to_file(&path, &destination, encoding) {
                     Ok(()) => written += 1,
-                    Err(err) => eprintln!("static cache: {}: {err}", path.display()),
+                    Err(err) => eprintln!("ERR: static cache: {}: {err}", path.display()),
                 }
             }
         }

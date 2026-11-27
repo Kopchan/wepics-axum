@@ -15,7 +15,7 @@ pub fn bind_available_port(
                 let actual_addr = listener.local_addr()?;
                 if attempt > 0 {
                     println!(
-                        "Port {} was busy, bound to {actual_addr} instead",
+                        "WARN: port {} was busy, bound to {actual_addr} instead",
                         addr.port() - attempt
                     );
                 }
@@ -41,6 +41,6 @@ pub fn bind_available_port(
 
     Err(io::Error::new(
         io::ErrorKind::AddrInUse,
-        format!("no free ports found after {max_attempts} attempts"),
+        format!("FATAL: no free ports found after {max_attempts} attempts"),
     ))
 }
