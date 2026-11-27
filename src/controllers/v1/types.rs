@@ -16,7 +16,8 @@ use crate::state::AppState;
 /// The album is joined in because nested requests return media from several
 /// albums and every item must say which album it came from.
 pub const MEDIA_COLUMNS: &str = "media.name, media.hash, media.\"type\", media.width, \
-     media.height, media.duration_sec, media.date, media.size, media.rating_level, media.album_id, \
+     media.height, media.duration_sec, media.framerate, media.frame_count, media.date, media.size, \
+     media.rating_level, media.album_id, \
      albums.hash AS album_hash, albums.name AS album_name, albums.path AS album_path, \
      albums.alias AS album_alias, albums.rating_level AS album_rating_level";
 
@@ -308,6 +309,9 @@ pub struct MediaItem {
     pub bitrate: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub framerate: Option<f64>,
+    /// Total frames in a video or animation.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub frame_count: Option<i64>,
 }
 
 /// `{ total, items }` — the shape every v1 list endpoint returns.
@@ -359,6 +363,8 @@ struct MediaParts<'a> {
     width: i64,
     height: i64,
     duration: Option<f64>,
+    framerate: Option<f64>,
+    frame_count: Option<i64>,
     date: Option<DateTime<Utc>>,
     size: i64,
     rating_level: Option<i64>,
@@ -379,6 +385,8 @@ impl MediaItem {
                 width: media.width,
                 height: media.height,
                 duration: media.duration_sec,
+                framerate: media.framerate,
+                frame_count: media.frame_count,
                 date: media.date,
                 size: media.size,
                 rating_level: media.rating_level,
@@ -408,6 +416,8 @@ impl MediaItem {
                 width: row.width,
                 height: row.height,
                 duration: row.duration_sec,
+                framerate: row.framerate,
+                frame_count: row.frame_count,
                 date: row.date,
                 size: row.size,
                 rating_level: row.rating_level,
@@ -439,7 +449,8 @@ impl MediaItem {
             reactions: None,
             duration: parts.duration,
             bitrate,
-            framerate: None,
+            framerate: parts.framerate,
+            frame_count: parts.frame_count,
         }
     }
 }
@@ -1009,7 +1020,9 @@ pub fn push_media_order_exprs(builder: &mut QueryBuilder<Sqlite>, sorts: &[Media
                     .push(direction);
             }
             MediaSortField::Framerate => {
-                builder.push("0");
+                builder
+                    .push("media.framerate IS NULL ASC, media.framerate")
+                    .push(direction);
             }
             MediaSortField::Order => {
                 builder.push("media.id").push(direction);
@@ -1035,7 +1048,8 @@ fn media_value_sql(field: MediaSortField) -> &'static str {
             "ABS((CAST(MAX(media.width, media.height) AS REAL) \
              / NULLIF(MIN(media.width, media.height), 0)) - 1)"
         }
-        MediaSortField::Reacts | MediaSortField::Framerate => "0",
+        MediaSortField::Reacts => "0",
+        MediaSortField::Framerate => "media.framerate",
         MediaSortField::Duration => "media.duration_sec",
         MediaSortField::Bitrate => {
             "(CAST(media.size AS REAL) * 8.0 / NULLIF(media.duration_sec, 0))"
@@ -1220,6 +1234,8 @@ struct MediaRow {
     width: i64,
     height: i64,
     duration_sec: Option<f64>,
+    framerate: Option<f64>,
+    frame_count: Option<i64>,
     date: Option<DateTime<Utc>>,
     size: i64,
     rating_level: Option<i64>,

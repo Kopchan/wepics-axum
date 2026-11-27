@@ -9,8 +9,8 @@ use tokio_stream::StreamExt;
 use tower::ServiceExt;
 
 use crate::common::{
-    app, create_dir_link, insert_album, link, parse_v1, root_album_id, send, send_with,
-    set_indexed_at, setup, wait_for_indexed, wait_for_media_count,
+    app, create_dir_link, ffmpeg_available, insert_album, link, parse_v1, root_album_id, send,
+    send_with, set_indexed_at, setup, wait_for_indexed, wait_for_media_count, write_sample_video,
 };
 use wepics_axum::models::{Album, Media, MediaType};
 
@@ -297,8 +297,8 @@ async fn sync_indexes_files_and_discovers_child_albums() {
     wait_for_indexed(&state, root_id, since).await;
 
     let rows: Vec<Media> = sqlx::query_as(
-        "SELECT id, name, hash, \"type\", album_id, width, height, duration_sec, date, size,
-                rating_level, sort_name, created_at, updated_at
+        "SELECT id, name, hash, \"type\", album_id, width, height, duration_sec, framerate,
+                frame_count, date, size, rating_level, sort_name, created_at, updated_at
          FROM media WHERE album_id = ?1 ORDER BY name",
     )
     .bind(root_id)
@@ -401,8 +401,8 @@ async fn sync_indexes_files_and_discovers_child_albums() {
     wait_for_indexed(&state, winter.id, winter_since).await;
 
     let child_media: Vec<Media> = sqlx::query_as(
-        "SELECT id, name, hash, \"type\", album_id, width, height, duration_sec, date, size,
-                rating_level, sort_name, created_at, updated_at
+        "SELECT id, name, hash, \"type\", album_id, width, height, duration_sec, framerate,
+                frame_count, date, size, rating_level, sort_name, created_at, updated_at
          FROM media WHERE album_id = ?1",
     )
     .bind(winter.id)
@@ -677,6 +677,60 @@ async fn indexing_stores_image_and_vector_dimensions() {
     assert_eq!(album["stats"]["direct"]["imagesCount"], 2);
     assert_eq!(album["media"][0]["type"], "vector");
     assert_eq!(album["media"][0]["width"], 120);
+
+    drop(dir);
+}
+
+#[tokio::test]
+async fn indexing_stores_video_timing_metadata() {
+    let (dir, state) = setup().await;
+
+    if !ffmpeg_available() {
+        return;
+    }
+
+    let root_id = root_album_id(&state).await;
+    let source = state.config.media_dir.join("clip.mp4");
+    if !write_sample_video(&source, 320, 240, 3) {
+        return;
+    }
+
+    set_indexed_at(&state, root_id, None).await;
+    let app = app(state.clone());
+    let since = Utc::now() - chrono::Duration::seconds(1);
+    let (status, _, _) = send(&app, "/api/v1/album/root/index?force").await;
+    assert_eq!(status, StatusCode::OK);
+    wait_for_indexed(&state, root_id, since).await;
+
+    let row: (String, i64, i64, Option<f64>, Option<f64>, Option<i64>) = sqlx::query_as(
+        "SELECT \"type\", width, height, duration_sec, framerate, frame_count FROM media \
+         WHERE name = 'clip.mp4'",
+    )
+    .fetch_one(&state.db)
+    .await
+    .unwrap();
+
+    assert_eq!(row.0, "video");
+    assert_eq!((row.1, row.2), (320, 240));
+    let duration = row.3.expect("duration is probed");
+    assert!((duration - 3.0).abs() < 0.2, "duration = {duration}");
+    let framerate = row.4.expect("framerate is probed");
+    assert!((framerate - 25.0).abs() < 0.1, "framerate = {framerate}");
+    let frame_count = row.5.expect("frame count is probed");
+    assert!(frame_count >= 70, "frame count = {frame_count}");
+
+    // The API exposes the same values to the client.
+    let (_, _, body) = send(&app, "/api/v1/album/root?mlimit=10").await;
+    let album = parse_v1(&body);
+    let item = album["media"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|item| item["name"] == "clip")
+        .expect("indexed video appears in the album");
+    assert_eq!(item["type"], "video");
+    assert_eq!(item["framerate"], 25.0);
+    assert_eq!(item["frameCount"], frame_count);
 
     drop(dir);
 }

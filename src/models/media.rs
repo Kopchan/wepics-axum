@@ -33,6 +33,10 @@ pub struct Media {
     pub height: i64,
     /// Seconds. `None` for still images.
     pub duration_sec: Option<f64>,
+    /// Frames per second. `None` when unknown or not animated.
+    pub framerate: Option<f64>,
+    /// Total number of frames. `None` when unknown.
+    pub frame_count: Option<i64>,
     /// File timestamp, used by `?sort=date`. `None` when unknown.
     pub date: Option<DateTime<Utc>>,
     /// File size in bytes, used by `?sort=size`.

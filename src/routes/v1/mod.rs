@@ -3,3 +3,4 @@
 pub mod api;
 pub mod files;
 pub mod thumb;
+pub mod transc;

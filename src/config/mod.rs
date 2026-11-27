@@ -14,6 +14,7 @@
 //! data/media              MEDIA_DIR
 //! data/cache              CACHE_DIR (previews + compressed frontend)
 //! data/cache/public       precompressed static files (.br / .gz)
+//! data/cache/frames       extracted video/animation frames (lossless PNG)
 //! data/database/wepics.db DATABASE_FILE
 //! data/cert/cert.pem      TLS_CERT, generated when missing
 //! data/cert/key.pem       TLS_KEY,  generated when missing
@@ -32,6 +33,8 @@
 //! | `TLS_CERT` / `TLS_KEY` | certificate pair, used only when both exist | `{DATA_DIR}/cert/*.pem` |
 //! | `PUBLIC_URL` | canonical origin for OG tags, request host otherwise | — |
 //! | `BIND_ATTEMPTS` | ports to probe when the configured one is busy | `100` |
+//! | `FFMPEG_BIN` | `ffmpeg` executable used for frames/transcodes | `ffmpeg` from `PATH` |
+//! | `FFPROBE_BIN` | `ffprobe` executable used for video metadata | `ffprobe` from `PATH` |
 //!
 //! Relative `DATA_DIR` and `PUBLIC_DIR` defaults live beside the executable
 //! in an installed build, and in the working directory during development.
@@ -83,6 +86,10 @@ pub struct AppConfig {
     pub public_url: Option<String>,
     /// How many ports to probe when the configured one is busy.
     pub bind_attempts: u16,
+    /// `ffmpeg` executable used to extract frames and transcode videos.
+    pub ffmpeg_bin: PathBuf,
+    /// `ffprobe` executable used to read video/animation metadata.
+    pub ffprobe_bin: PathBuf,
 }
 
 impl AppConfig {
@@ -102,6 +109,8 @@ impl AppConfig {
             tls_key: None,
             public_url: None,
             bind_attempts: DEFAULT_BIND_ATTEMPTS,
+            ffmpeg_bin: PathBuf::from("ffmpeg"),
+            ffprobe_bin: PathBuf::from("ffprobe"),
             data_dir,
         }
     }
@@ -133,6 +142,8 @@ impl AppConfig {
                 .map(|url| url.trim_end_matches('/').to_owned())
                 .filter(|url| !url.is_empty()),
             bind_attempts: env_number("BIND_ATTEMPTS").unwrap_or(defaults.bind_attempts),
+            ffmpeg_bin: env_path("FFMPEG_BIN").unwrap_or(defaults.ffmpeg_bin),
+            ffprobe_bin: env_path("FFPROBE_BIN").unwrap_or(defaults.ffprobe_bin),
             data_dir,
         })
     }
@@ -182,6 +193,12 @@ impl AppConfig {
     /// Root directory used to store previews.
     pub fn thumb_dir(&self) -> PathBuf {
         thumb_dir(&self.cache_dir)
+    }
+
+    /// Directory holding original-size frames extracted from videos and
+    /// animations. Other preview sizes are derived from these files.
+    pub fn frames_dir(&self) -> PathBuf {
+        self.cache_dir.join("frames")
     }
 }
 
@@ -252,6 +269,7 @@ mod tests {
             config.compressed_public_dir(),
             root.join("cache").join("public")
         );
+        assert_eq!(config.frames_dir(), root.join("cache").join("frames"));
         assert_eq!(
             config.default_tls_cert(),
             root.join("cert").join("cert.pem")

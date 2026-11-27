@@ -4,8 +4,8 @@ use crate::state::AppState;
 
 /// Columns selected for a media row, kept in the same shape as [`Media`].
 const MEDIA_BY_HASH: &str = "SELECT id, name, hash, \"type\", album_id, width, height, \
-     duration_sec, date, size, rating_level, sort_name, created_at, updated_at FROM media \
-     WHERE album_id = ?1 AND hash = ?2";
+     duration_sec, framerate, frame_count, date, size, rating_level, sort_name, created_at, \
+     updated_at FROM media WHERE album_id = ?1 AND hash = ?2";
 
 /// Looks a media row up by album and media hash.
 ///

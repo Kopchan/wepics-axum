@@ -200,7 +200,8 @@ pub async fn insert_typed_media(
         r#"INSERT INTO media (name, hash, "type", album_id, width, height, date, size, sort_name)
            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
            RETURNING id, name, hash, "type", album_id, width, height, duration_sec,
-                     date, size, rating_level, sort_name, created_at, updated_at"#,
+                     framerate, frame_count, date, size, rating_level, sort_name,
+                     created_at, updated_at"#,
     )
     .bind(name)
     .bind(hash)
@@ -315,6 +316,74 @@ pub fn write_png(path: &Path, width: u32, height: u32) {
     image::RgbImage::from_pixel(width, height, image::Rgb([10, 20, 30]))
         .save(path)
         .unwrap();
+}
+
+/// Whether FFmpeg and FFprobe are on `PATH`.
+///
+/// Video tests need real binaries; when they are absent the test returns early
+/// instead of failing on a machine that only compiles the server.
+pub fn ffmpeg_available() -> bool {
+    ["ffmpeg", "ffprobe"].into_iter().all(|bin| {
+        std::process::Command::new(bin)
+            .arg("-version")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .map(|status| status.success())
+            .unwrap_or(false)
+    })
+}
+
+/// Encodes a short solid-colour H.264 MP4 with FFmpeg.
+///
+/// Returns `false` when the encoder is unavailable, so callers can skip.
+pub fn write_sample_video(path: &Path, width: u32, height: u32, seconds: u32) -> bool {
+    let source = format!("color=c=blue:s={width}x{height}:r=25:d={seconds}");
+    std::process::Command::new("ffmpeg")
+        .args([
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-y",
+            "-f",
+            "lavfi",
+            "-i",
+            &source,
+            "-pix_fmt",
+            "yuv420p",
+            "-c:v",
+            "libx264",
+        ])
+        .arg(path)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(false)
+}
+
+/// Encodes a short solid-colour animated GIF with FFmpeg.
+pub fn write_sample_animation(path: &Path, width: u32, height: u32, seconds: u32) -> bool {
+    let source = format!("color=c=red:s={width}x{height}:r=10:d={seconds}");
+    std::process::Command::new("ffmpeg")
+        .args([
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-y",
+            "-f",
+            "lavfi",
+            "-i",
+            &source,
+            "-loop",
+            "0",
+        ])
+        .arg(path)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(false)
 }
 
 #[cfg(windows)]

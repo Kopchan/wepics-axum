@@ -3,8 +3,8 @@
 use axum::http::StatusCode;
 
 use crate::common::{
-    NewMedia, app, at, insert_media, insert_typed_media, link, root_album_id, send, setup,
-    write_png,
+    NewMedia, app, at, ffmpeg_available, insert_media, insert_typed_media, link, root_album_id,
+    send, setup, write_png, write_sample_animation, write_sample_video,
 };
 use wepics_axum::models::MediaType;
 
@@ -167,9 +167,91 @@ async fn vector_previews_are_rendered() {
 }
 
 #[tokio::test]
-async fn video_previews_are_rejected() {
+async fn animated_previews_use_a_cached_frame() {
+    let (dir, state) = setup().await;
+
+    if !ffmpeg_available() {
+        return;
+    }
+
+    let root_id = root_album_id(&state).await;
+    let source = state.config.media_dir.join("loop.gif");
+    if !write_sample_animation(&source, 64, 48, 1) {
+        return;
+    }
+
+    insert_typed_media(
+        &state.db,
+        root_id,
+        "loop.gif",
+        "ani",
+        MediaType::Animated,
+        64,
+        48,
+        None,
+        1024,
+    )
+    .await;
+    sqlx::query(
+        "UPDATE media SET duration_sec = 1.0, framerate = 10.0, frame_count = 10 \
+         WHERE hash = 'ani'",
+    )
+    .execute(&state.db)
+    .await
+    .unwrap();
+
+    let app = app(state.clone());
+    let query = link(&state, "root", "ani");
+    let (status, _, body) = send(&app, &format!("/thumb/v1/root/ani/w48?{query}")).await;
+    assert_eq!(status, StatusCode::OK);
+    let preview = image::load_from_memory(&body).unwrap();
+    // 48 snaps up to 144, and the 64 px source is not upscaled.
+    assert_eq!((preview.width(), preview.height()), (64, 48));
+    assert!(state.frame_path("ani").is_file());
+
+    drop(dir);
+}
+
+#[tokio::test]
+async fn only_images_and_videos_have_previews() {
     let (dir, state) = setup().await;
     let root_id = root_album_id(&state).await;
+
+    insert_typed_media(
+        &state.db,
+        root_id,
+        "song.mp3",
+        "aud",
+        MediaType::Audio,
+        0,
+        0,
+        None,
+        10,
+    )
+    .await;
+    std::fs::write(state.config.media_dir.join("song.mp3"), b"mp3").unwrap();
+
+    let app = app(state.clone());
+    let query = link(&state, "root", "aud");
+    let (status, _, _) = send(&app, &format!("/thumb/v1/root/aud/w144?{query}")).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+
+    drop(dir);
+}
+
+#[tokio::test]
+async fn video_previews_are_rendered_from_a_cached_frame() {
+    let (dir, state) = setup().await;
+
+    if !ffmpeg_available() {
+        return;
+    }
+
+    let root_id = root_album_id(&state).await;
+    let source = state.config.media_dir.join("clip.mp4");
+    if !write_sample_video(&source, 320, 240, 3) {
+        return;
+    }
 
     insert_typed_media(
         &state.db,
@@ -177,18 +259,41 @@ async fn video_previews_are_rejected() {
         "clip.mp4",
         "vid",
         MediaType::Video,
-        0,
-        0,
+        320,
+        240,
         None,
-        10,
+        4096,
     )
     .await;
-    std::fs::write(state.config.media_dir.join("clip.mp4"), b"mp4").unwrap();
+    sqlx::query(
+        "UPDATE media SET duration_sec = 3.0, framerate = 25.0, frame_count = 75 \
+         WHERE hash = 'vid'",
+    )
+    .execute(&state.db)
+    .await
+    .unwrap();
 
     let app = app(state.clone());
     let query = link(&state, "root", "vid");
-    let (status, _, _) = send(&app, &format!("/thumb/v1/root/vid/w144?{query}")).await;
-    assert_eq!(status, StatusCode::BAD_REQUEST);
+
+    let (status, headers, body) = send(&app, &format!("/thumb/v1/root/vid/w144?{query}")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(headers[axum::http::header::CONTENT_TYPE], "image/webp");
+    let preview = image::load_from_memory(&body).unwrap();
+    assert_eq!((preview.width(), preview.height()), (144, 108));
+
+    // The original-size frame is cached as lossless PNG and reused for other
+    // preview sizes without decoding the video again.
+    let frame_path = state.frame_path("vid");
+    let frame = std::fs::read(&frame_path).expect("frame must be cached");
+    assert_eq!(&frame[..8], b"\x89PNG\r\n\x1a\n");
+    let cached_frame = image::load_from_memory(&frame).unwrap();
+    assert_eq!((cached_frame.width(), cached_frame.height()), (320, 240));
+
+    let (status, _, body) = send(&app, &format!("/thumb/v1/root/vid/h240?{query}")).await;
+    assert_eq!(status, StatusCode::OK);
+    let preview = image::load_from_memory(&body).unwrap();
+    assert_eq!((preview.width(), preview.height()), (320, 240));
 
     drop(dir);
 }

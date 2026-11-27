@@ -35,13 +35,17 @@ const PROGRESS_INTERVAL: StdDuration = StdDuration::from_millis(200);
 const STALE_AFTER_HOURS: i64 = 1;
 
 const UPSERT_MEDIA: &str = r#"
-INSERT INTO media (name, hash, "type", album_id, width, height, size, date, sort_name, hash_version)
-VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+INSERT INTO media (name, hash, "type", album_id, width, height, duration_sec, framerate,
+                   frame_count, size, date, sort_name, hash_version)
+VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
 ON CONFLICT(album_id, name) DO UPDATE SET
     hash = excluded.hash,
     "type" = excluded."type",
     width = excluded.width,
     height = excluded.height,
+    duration_sec = excluded.duration_sec,
+    framerate = excluded.framerate,
+    frame_count = excluded.frame_count,
     size = excluded.size,
     date = excluded.date,
     sort_name = excluded.sort_name,
@@ -148,7 +152,7 @@ pub fn start(state: &AppState, album: &Album, options: IndexOptions) -> SyncStar
         match result {
             Ok(()) => progress.finish(&album, IndexPhase::Done, None),
             Err(err) => {
-                eprintln!("sync of album `{}` failed: {err}", album.hash);
+                eprintln!("ERR: sync of album `{}` failed: {err}", album.hash);
                 progress.finish(&album, IndexPhase::Error, Some(err.to_string()));
             }
         }
@@ -329,8 +333,8 @@ async fn sync_one(
     // resolve duplicates and to delete rows whose files disappeared. The album
     // is claimed exclusively, so a plain read is enough here.
     let existing: Vec<ExistingMedia> = sqlx::query_as(
-        "SELECT id, name, hash, width, height, size, date, hash_version \
-         FROM media WHERE album_id = ?1",
+        "SELECT id, name, hash, width, height, duration_sec, framerate, frame_count, size, date, \
+         hash_version FROM media WHERE album_id = ?1",
     )
     .bind(album.id)
     .fetch_all(&state.db)
@@ -395,7 +399,7 @@ async fn sync_one(
         let metadata = match tokio::fs::metadata(&entry.path).await {
             Ok(metadata) => metadata,
             Err(err) => {
-                eprintln!("skipping `{}`: {err}", entry.path.display());
+                eprintln!("ERR: skipping `{}`: {err}", entry.path.display());
                 progress.file_done();
                 continue;
             }
@@ -417,26 +421,32 @@ async fn sync_one(
                 media_type: entry.media_type,
                 width: known.width,
                 height: known.height,
+                duration_sec: known.duration_sec,
+                framerate: known.framerate,
+                frame_count: known.frame_count,
                 size,
                 date,
                 sort_name: natural_sort_key(&entry.name),
                 known_row: Some(known.row),
             },
             None => {
-                let (width, height, hash) = match probe_file(entry).await {
+                let probed = match probe_file(entry, &state.config.ffprobe_bin).await {
                     Ok(probed) => probed,
                     Err(err) => {
-                        eprintln!("skipping `{}`: {err}", entry.path.display());
+                        eprintln!("ERR: skipping `{}`: {err}", entry.path.display());
                         progress.file_done();
                         continue;
                     }
                 };
                 ScannedFile {
                     name: entry.name.clone(),
-                    hash,
+                    hash: probed.hash,
                     media_type: entry.media_type,
-                    width,
-                    height,
+                    width: probed.metadata.width,
+                    height: probed.metadata.height,
+                    duration_sec: probed.metadata.duration_sec,
+                    framerate: probed.metadata.framerate,
+                    frame_count: probed.metadata.frame_count,
                     size,
                     date,
                     sort_name: natural_sort_key(&entry.name),
@@ -664,6 +674,9 @@ async fn write_scanned_batch(
                     .bind(album.id)
                     .bind(file.width)
                     .bind(file.height)
+                    .bind(file.duration_sec)
+                    .bind(file.framerate)
+                    .bind(file.frame_count)
                     .bind(file.size)
                     .bind(file.date)
                     .bind(&file.sort_name)
@@ -740,7 +753,7 @@ async fn sync_subtree(
         let canonical = match tokio::fs::canonicalize(&child_dir).await {
             Ok(path) => path,
             Err(err) => {
-                eprintln!("skipping child `{}`: {err}", child_dir.display());
+                eprintln!("ERR: skipping child `{}`: {err}", child_dir.display());
                 continue;
             }
         };
@@ -809,7 +822,7 @@ async fn count_tree(
             let metadata = match tokio::fs::metadata(&path).await {
                 Ok(metadata) => metadata,
                 Err(err) => {
-                    eprintln!("skipping `{}`: {err}", path.display());
+                    eprintln!("ERR: skipping `{}`: {err}", path.display());
                     continue;
                 }
             };
@@ -818,7 +831,7 @@ async fn count_tree(
                 let canonical = match tokio::fs::canonicalize(&path).await {
                     Ok(path) => path,
                     Err(err) => {
-                        eprintln!("skipping `{}`: {err}", path.display());
+                        eprintln!("ERR: skipping `{}`: {err}", path.display());
                         continue;
                     }
                 };
@@ -853,6 +866,9 @@ struct ExistingMedia {
     hash: String,
     width: i64,
     height: i64,
+    duration_sec: Option<f64>,
+    framerate: Option<f64>,
+    frame_count: Option<i64>,
     size: i64,
     date: Option<DateTime<Utc>>,
     hash_version: i64,
@@ -879,6 +895,12 @@ struct DuplicaData {
     width: i64,
     #[serde(default)]
     height: i64,
+    #[serde(default)]
+    duration_sec: Option<f64>,
+    #[serde(default)]
+    framerate: Option<f64>,
+    #[serde(default)]
+    frame_count: Option<i64>,
     /// Hash input version, see [`MEDIA_HASH_VERSION`].
     #[serde(default)]
     version: i64,
@@ -892,6 +914,9 @@ impl From<&ScannedFile> for DuplicaData {
             date: file.date,
             width: file.width,
             height: file.height,
+            duration_sec: file.duration_sec,
+            framerate: file.framerate,
+            frame_count: file.frame_count,
             version: MEDIA_HASH_VERSION,
         }
     }
@@ -909,6 +934,9 @@ struct KnownFile {
     hash: String,
     width: i64,
     height: i64,
+    duration_sec: Option<f64>,
+    framerate: Option<f64>,
+    frame_count: Option<i64>,
     row: KnownRow,
 }
 
@@ -927,11 +955,21 @@ fn known_file(
         if media.hash_version == MEDIA_HASH_VERSION
             && media.size == size
             && same_mtime(media.date, date)
+            && !needs_metadata_backfill(
+                entry.media_type,
+                media.width,
+                media.height,
+                media.duration_sec,
+                media.framerate,
+            )
         {
             return Some(KnownFile {
                 hash: media.hash.clone(),
                 width: media.width,
                 height: media.height,
+                duration_sec: media.duration_sec,
+                framerate: media.framerate,
+                frame_count: media.frame_count,
                 row: KnownRow::Media(media.id),
             });
         }
@@ -939,15 +977,42 @@ fn known_file(
     }
 
     let (media_id, dup) = existing_dups_by_name.get(entry.name.as_str())?;
-    if dup.version == MEDIA_HASH_VERSION && dup.size == size && same_mtime(dup.date, date) {
+    if dup.version == MEDIA_HASH_VERSION
+        && dup.size == size
+        && same_mtime(dup.date, date)
+        && !needs_metadata_backfill(
+            entry.media_type,
+            dup.width,
+            dup.height,
+            dup.duration_sec,
+            dup.framerate,
+        )
+    {
         return Some(KnownFile {
             hash: dup.hash.clone(),
             width: dup.width,
             height: dup.height,
+            duration_sec: dup.duration_sec,
+            framerate: dup.framerate,
+            frame_count: dup.frame_count,
             row: KnownRow::Duplica(*media_id),
         });
     }
     None
+}
+
+/// Rows written before video probing existed have video/animation dimensions
+/// and timing left empty. Such a file is re-read once so the new columns are
+/// filled in by the next scan instead of staying NULL forever.
+fn needs_metadata_backfill(
+    media_type: MediaType,
+    width: i64,
+    height: i64,
+    duration_sec: Option<f64>,
+    framerate: Option<f64>,
+) -> bool {
+    matches!(media_type, MediaType::Video | MediaType::Animated)
+        && (width <= 0 || height <= 0 || duration_sec.is_none() || framerate.is_none())
 }
 
 /// Compares filesystem timestamps at millisecond precision, the precision
@@ -962,6 +1027,9 @@ struct ScannedFile {
     media_type: MediaType,
     width: i64,
     height: i64,
+    duration_sec: Option<f64>,
+    framerate: Option<f64>,
+    frame_count: Option<i64>,
     size: i64,
     date: Option<DateTime<Utc>>,
     sort_name: String,
@@ -1009,7 +1077,7 @@ async fn classify_entries(
         let path = entry.path();
         let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
             eprintln!(
-                "skipping non-UTF-8 file name in `{}`",
+                "ERR: skipping non-UTF-8 file name in `{}`",
                 entry.path().display()
             );
             continue;
@@ -1021,7 +1089,7 @@ async fn classify_entries(
         let file_type = match entry.file_type().await {
             Ok(file_type) => file_type,
             Err(err) => {
-                eprintln!("skipping `{}`: {err}", path.display());
+                eprintln!("ERR: skipping `{}`: {err}", path.display());
                 continue;
             }
         };
@@ -1032,7 +1100,7 @@ async fn classify_entries(
             match tokio::fs::metadata(&path).await {
                 Ok(metadata) => Some(metadata),
                 Err(err) => {
-                    eprintln!("skipping `{}`: {err}", path.display());
+                    eprintln!("ERR: skipping `{}`: {err}", path.display());
                     continue;
                 }
             }
@@ -1081,55 +1149,106 @@ fn join_path(parent: &str, name: &str) -> String {
     }
 }
 
-/// Reads image dimensions and hashes the file in one blocking pass.
+/// Metadata read from a file during indexing.
+#[derive(Debug, Clone, Copy, Default)]
+struct ProbedMetadata {
+    width: i64,
+    height: i64,
+    duration_sec: Option<f64>,
+    framerate: Option<f64>,
+    frame_count: Option<i64>,
+}
+
+/// A file whose metadata was read and whose content was hashed.
+struct ProbedFile {
+    hash: String,
+    metadata: ProbedMetadata,
+}
+
+/// Reads media metadata and hashes the file in one blocking pass.
 ///
-/// Still and animated images use a lightweight header parser; vectors need
-/// libvips because SVG has no raster header. Videos and audio keep `0`, which
-/// the API treats as "unknown". A malformed or unsupported file is not an
-/// indexing error, it simply has no dimensions.
-async fn probe_file(entry: &MediaEntry) -> std::io::Result<(i64, i64, String)> {
+/// Still images and vectors use a lightweight header parser; videos and
+/// animations go through `ffprobe`, with an image-header fallback for animated
+/// files when FFmpeg is unavailable. A malformed or unsupported file is not an
+/// indexing error, it simply has no metadata.
+async fn probe_file(entry: &MediaEntry, ffprobe: &Path) -> std::io::Result<ProbedFile> {
     let path = entry.path.clone();
     let media_type = entry.media_type;
+    let ffprobe = ffprobe.to_path_buf();
     tokio::task::spawn_blocking(move || {
-        let (width, height) = probe_dimensions(&path, media_type);
+        let metadata = probe_metadata(&path, media_type, &ffprobe);
         let hash = hashes::media_hash(&path)?;
-        Ok((width, height, hash))
+        Ok(ProbedFile { hash, metadata })
     })
     .await
     .map_err(|err| std::io::Error::other(err.to_string()))?
 }
 
-fn probe_dimensions(path: &Path, media_type: MediaType) -> (i64, i64) {
+fn probe_metadata(path: &Path, media_type: MediaType, ffprobe: &Path) -> ProbedMetadata {
+    // FFprobe understands every video container the indexer accepts, plus GIF
+    // and APNG. It also reports duration and frame rate, which header parsers
+    // cannot provide.
+    if matches!(media_type, MediaType::Video | MediaType::Animated)
+        && let Some(meta) = crate::helpers::video::probe(ffprobe, path)
+    {
+        let mut metadata = ProbedMetadata {
+            width: meta.width,
+            height: meta.height,
+            duration_sec: meta.duration_sec,
+            framerate: meta.framerate,
+            frame_count: meta.frame_count,
+        };
+
+        // Some containers omit the stream dimensions; the image header still
+        // knows them for animations (and costs nothing for videos that do not).
+        if (metadata.width <= 0 || metadata.height <= 0)
+            && let Some((width, height)) = image_dimensions(path)
+        {
+            metadata.width = width;
+            metadata.height = height;
+        }
+
+        return metadata;
+    }
+
     if !matches!(
         media_type,
         MediaType::Image | MediaType::Animated | MediaType::Vector
     ) {
-        return (0, 0);
+        return ProbedMetadata::default();
     }
 
     let dimensions = if media_type == MediaType::Vector {
         vips_dimensions(path)
     } else {
-        imagesize::size(path)
-            .map(|size| (size.width, size.height))
-            .ok()
+        image_dimensions(path)
     };
 
     match dimensions {
-        Some((width, height)) => (
-            i64::try_from(width).unwrap_or(i64::MAX),
-            i64::try_from(height).unwrap_or(i64::MAX),
-        ),
-        None => (0, 0),
+        Some((width, height)) => ProbedMetadata {
+            width,
+            height,
+            ..ProbedMetadata::default()
+        },
+        None => ProbedMetadata::default(),
     }
+}
+
+fn image_dimensions(path: &Path) -> Option<(i64, i64)> {
+    imagesize::size(path).ok().map(|size| {
+        (
+            i64::try_from(size.width).unwrap_or(i64::MAX),
+            i64::try_from(size.height).unwrap_or(i64::MAX),
+        )
+    })
 }
 
 /// Vector dimensions through libvips. SVG is rendered lazily, so this only
 /// parses the document and reports its intrinsic size.
-fn vips_dimensions(path: &Path) -> Option<(usize, usize)> {
+fn vips_dimensions(path: &Path) -> Option<(i64, i64)> {
     crate::config::vips::ensure().ok()?;
     let image = vips::VipsImage::from_file(path).ok()?;
-    Some((image.width() as usize, image.height() as usize))
+    Some((i64::from(image.width()), i64::from(image.height())))
 }
 
 /// Maps a file extension to the media type stored in SQLite.

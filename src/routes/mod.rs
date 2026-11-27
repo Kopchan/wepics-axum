@@ -31,6 +31,7 @@ async fn revalidate_static(req: Request, next: Next) -> Response {
         || path.starts_with("/api")
         || path.starts_with("/file")
         || path.starts_with("/thumb")
+        || path.starts_with("/transc")
     {
         return response;
     }
@@ -74,6 +75,7 @@ pub fn app(state: AppState) -> Router {
         .nest("/api/v1", v1::api::router())
         .nest("/file/v1", v1::files::router())
         .nest("/thumb/v1", v1::thumb::router())
+        .nest("/transc/v2", v1::transc::router())
         .fallback_service(static_files)
         .layer(middleware::from_fn_with_state(
             static_cache,

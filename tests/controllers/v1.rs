@@ -5,4 +5,5 @@ mod file;
 mod index;
 mod media;
 mod thumb;
+mod transc;
 mod types;

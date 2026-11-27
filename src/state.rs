@@ -90,6 +90,8 @@ impl AppState {
         // Previews live in the cache root, never inside the media tree, so the
         // indexer cannot mistake them for albums or media.
         tokio::fs::create_dir_all(self.thumb_dir()).await?;
+        // Original-size frames are shared by every video preview size.
+        tokio::fs::create_dir_all(self.config.frames_dir()).await?;
 
         // `OR IGNORE` makes restarts idempotent.
         sqlx::query("INSERT OR IGNORE INTO albums (name, hash, sort_name) VALUES (?1, ?1, ?2)")
@@ -104,6 +106,11 @@ impl AppState {
     /// Root directory for generated previews.
     pub fn thumb_dir(&self) -> PathBuf {
         self.config.thumb_dir()
+    }
+
+    /// Cached original-size frame for a video or animation.
+    pub fn frame_path(&self, media_hash: &str) -> PathBuf {
+        self.config.frames_dir().join(format!("{media_hash}.png"))
     }
 
     /// Short-lived signature for `/thumb/v1` and `/file/v1`.
