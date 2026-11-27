@@ -35,14 +35,14 @@ fn embed_windows_icon() {}
 
 #[cfg(target_os = "windows")]
 fn embed_windows_icon() {
-    println!("cargo:rerun-if-changed=public/icon");
+    println!("cargo:rerun-if-changed=public/assets/icon");
 
-    let ico_path = Path::new("public/icon/app.ico");
+    let ico_path = Path::new("public/assets/icon/app.ico");
     let mut icon_dir = ico::IconDir::new(ico::ResourceType::Icon);
     let sizes = [24, 32, 48, 64, 96, 128, 192, 256];
 
     for size in sizes {
-        let png_path = format!("public/icon/app{}.png", size);
+        let png_path = format!("public/assets/icon/app{}.png", size);
         if Path::new(&png_path).exists()
             && let Ok(img) = image::open(&png_path)
         {

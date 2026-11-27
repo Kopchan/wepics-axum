@@ -69,17 +69,17 @@ identifier = "com.wepics.wepicserv"
 # `public` beside the executable, together with the `data` root.
 resources = [{ src = "public", target = "public" }]
 icons = [
-    "public/icon/app.ico",
-    "public/icon/app24.png",
-    "public/icon/app32.png",
-    "public/icon/app48.png",
-    "public/icon/app64.png",
-    "public/icon/app96.png",
-    "public/icon/app128.png",
-    "public/icon/app192.png",
-    "public/icon/app256.png",
-    "public/icon/app512.png"
+    "public/assets/icon/app.ico",
+    "public/assets/icon/app24.png",
+    "public/assets/icon/app32.png",
+    "public/assets/icon/app48.png",
+    "public/assets/icon/app64.png",
+    "public/assets/icon/app96.png",
+    "public/assets/icon/app128.png",
+    "public/assets/icon/app192.png",
+    "public/assets/icon/app256.png",
+    "public/assets/icon/app512.png"
 ]
 
 [package.metadata.packager.nsis]
-installer-icon = "public/icon/app.ico"
+installer-icon = "public/assets/icon/app.ico"
