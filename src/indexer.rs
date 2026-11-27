@@ -411,7 +411,14 @@ async fn sync_one(
         // present: without it, two different files with the same size are
         // indistinguishable.
         let known = date.and_then(|date| {
-            known_file(entry, &existing_by_name, &existing_dups_by_name, size, date)
+            known_file(
+                entry,
+                &existing_by_name,
+                &existing_dups_by_name,
+                size,
+                date,
+                state.capabilities.ffprobe,
+            )
         });
 
         let file = match known {
@@ -430,14 +437,25 @@ async fn sync_one(
                 known_row: Some(known.row),
             },
             None => {
-                let probed = match probe_file(entry, &state.config.ffprobe_bin).await {
-                    Ok(probed) => probed,
-                    Err(err) => {
-                        eprintln!("ERR: skipping `{}`: {err}", entry.path.display());
-                        progress.file_done();
-                        continue;
-                    }
-                };
+                let probed =
+                    match probe_file(entry, &state.config.ffprobe_bin, state.capabilities.ffprobe)
+                        .await
+                    {
+                        Ok(Some(probed)) => probed,
+                        Ok(None) => {
+                            eprintln!(
+                                "skipping `{}`: no readable video/animation dimensions",
+                                entry.path.display()
+                            );
+                            progress.file_done();
+                            continue;
+                        }
+                        Err(err) => {
+                            eprintln!("ERR: skipping `{}`: {err}", entry.path.display());
+                            progress.file_done();
+                            continue;
+                        }
+                    };
                 ScannedFile {
                     name: entry.name.clone(),
                     hash: probed.hash,
@@ -950,6 +968,7 @@ fn known_file(
     existing_dups_by_name: &HashMap<&str, (i64, DuplicaData)>,
     size: i64,
     date: DateTime<Utc>,
+    ffprobe_available: bool,
 ) -> Option<KnownFile> {
     if let Some(media) = existing_by_name.get(entry.name.as_str()) {
         if media.hash_version == MEDIA_HASH_VERSION
@@ -957,6 +976,7 @@ fn known_file(
             && same_mtime(media.date, date)
             && !needs_metadata_backfill(
                 entry.media_type,
+                ffprobe_available,
                 media.width,
                 media.height,
                 media.duration_sec,
@@ -982,6 +1002,7 @@ fn known_file(
         && same_mtime(dup.date, date)
         && !needs_metadata_backfill(
             entry.media_type,
+            ffprobe_available,
             dup.width,
             dup.height,
             dup.duration_sec,
@@ -1004,15 +1025,24 @@ fn known_file(
 /// Rows written before video probing existed have video/animation dimensions
 /// and timing left empty. Such a file is re-read once so the new columns are
 /// filled in by the next scan instead of staying NULL forever.
+///
+/// When FFprobe itself is missing, animations are indexed from their image
+/// header, so demanding timing data would force a re-read on every scan.
 fn needs_metadata_backfill(
     media_type: MediaType,
+    ffprobe_available: bool,
     width: i64,
     height: i64,
     duration_sec: Option<f64>,
     framerate: Option<f64>,
 ) -> bool {
-    matches!(media_type, MediaType::Video | MediaType::Animated)
-        && (width <= 0 || height <= 0 || duration_sec.is_none() || framerate.is_none())
+    if width <= 0 || height <= 0 {
+        return matches!(media_type, MediaType::Video | MediaType::Animated);
+    }
+
+    ffprobe_available
+        && matches!(media_type, MediaType::Video | MediaType::Animated)
+        && (duration_sec.is_none() || framerate.is_none())
 }
 
 /// Compares filesystem timestamps at millisecond precision, the precision
@@ -1169,26 +1199,49 @@ struct ProbedFile {
 ///
 /// Still images and vectors use a lightweight header parser; videos and
 /// animations go through `ffprobe`, with an image-header fallback for animated
-/// files when FFmpeg is unavailable. A malformed or unsupported file is not an
-/// indexing error, it simply has no metadata.
-async fn probe_file(entry: &MediaEntry, ffprobe: &Path) -> std::io::Result<ProbedFile> {
+/// files when FFprobe is unavailable. Videos and animations without readable
+/// dimensions are refused before the content is hashed: there is no point in
+/// reading a large file just to store an unusable row.
+async fn probe_file(
+    entry: &MediaEntry,
+    ffprobe: &Path,
+    ffprobe_available: bool,
+) -> std::io::Result<Option<ProbedFile>> {
     let path = entry.path.clone();
     let media_type = entry.media_type;
     let ffprobe = ffprobe.to_path_buf();
     tokio::task::spawn_blocking(move || {
-        let metadata = probe_metadata(&path, media_type, &ffprobe);
+        let metadata = probe_metadata(&path, media_type, &ffprobe, ffprobe_available);
+        if needs_video_metadata(media_type) && (metadata.width <= 0 || metadata.height <= 0) {
+            return Ok(None);
+        }
+
         let hash = hashes::media_hash(&path)?;
-        Ok(ProbedFile { hash, metadata })
+        Ok(Some(ProbedFile { hash, metadata }))
     })
     .await
     .map_err(|err| std::io::Error::other(err.to_string()))?
 }
 
-fn probe_metadata(path: &Path, media_type: MediaType, ffprobe: &Path) -> ProbedMetadata {
+/// Videos and animations must carry real frame dimensions. Images and vectors
+/// keep their historical behaviour of being indexed with zero dimensions when
+/// a header cannot be parsed.
+fn needs_video_metadata(media_type: MediaType) -> bool {
+    matches!(media_type, MediaType::Video | MediaType::Animated)
+}
+
+fn probe_metadata(
+    path: &Path,
+    media_type: MediaType,
+    ffprobe: &Path,
+    ffprobe_available: bool,
+) -> ProbedMetadata {
     // FFprobe understands every video container the indexer accepts, plus GIF
     // and APNG. It also reports duration and frame rate, which header parsers
-    // cannot provide.
+    // cannot provide. Without the binary, videos cannot be indexed at all;
+    // animations fall through to their image header so they remain visible.
     if matches!(media_type, MediaType::Video | MediaType::Animated)
+        && ffprobe_available
         && let Some(meta) = crate::helpers::video::probe(ffprobe, path)
     {
         let mut metadata = ProbedMetadata {

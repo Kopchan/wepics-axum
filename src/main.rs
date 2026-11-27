@@ -8,9 +8,9 @@ use wepics_axum::state::AppState;
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cfg = Arc::new(AppConfig::from_env()?);
-    config::vips::ensure()?;
 
     let state = AppState::connect(cfg.clone()).await?;
+    state.capabilities.report();
 
     // Готовим сжатые копии фронтенда до открытия портов: первый посетитель
     // должен получить `.br`/`.gz` уже с диска.

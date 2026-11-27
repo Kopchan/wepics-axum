@@ -41,6 +41,7 @@
 
 pub mod port;
 pub mod tls;
+pub mod tools;
 pub mod vips;
 
 use std::net::SocketAddr;

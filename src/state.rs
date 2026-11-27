@@ -7,6 +7,7 @@ use sqlx::SqlitePool;
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions};
 
 use crate::config::AppConfig;
+use crate::config::tools::Capabilities;
 use crate::helpers::secure_link;
 use crate::hubs::indexer::IndexHub;
 use crate::hubs::sync_tracker::{SyncGuard, SyncTracker};
@@ -19,6 +20,8 @@ pub struct AppState {
     pub db: SqlitePool,
     /// All runtime settings. Cheap to clone, shared by every request.
     pub config: Arc<AppConfig>,
+    /// Which optional media tools are usable in this environment.
+    pub capabilities: Capabilities,
     /// Per-process secret for media link signatures.
     secret: Arc<[u8; 32]>,
     /// Albums with a background indexing task in flight.
@@ -36,6 +39,7 @@ impl AppState {
         Self {
             db,
             config,
+            capabilities: Capabilities::assume_available(),
             secret: Arc::new(random_secret()),
             write_gate: Arc::new(tokio::sync::Mutex::new(())),
             syncing: SyncTracker::default(),
@@ -78,7 +82,9 @@ impl AppState {
 
         sqlx::migrate!("./migrations").run(&db).await?;
 
-        let state = Self::new(db, config);
+        let capabilities = Capabilities::detect(&config.ffmpeg_bin, &config.ffprobe_bin);
+        let mut state = Self::new(db, config);
+        state.capabilities = capabilities;
         state.initialize().await?;
         Ok(state)
     }

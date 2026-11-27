@@ -279,7 +279,6 @@ async fn sync_indexes_files_and_discovers_child_albums() {
     std::fs::write(media_dir.join("photo2.png"), b"png").unwrap();
     std::fs::write(media_dir.join("dup.jpg"), b"dup-jpg").unwrap();
     std::fs::write(media_dir.join("dup.png"), b"dup-png").unwrap();
-    std::fs::write(media_dir.join("clip.mp4"), b"mp4").unwrap();
     std::fs::write(media_dir.join("song.mp3"), b"mp3").unwrap();
     std::fs::write(media_dir.join("logo.svg"), b"<svg/>").unwrap();
     std::fs::write(media_dir.join("notes.txt"), b"ignored").unwrap();
@@ -310,7 +309,6 @@ async fn sync_indexes_files_and_discovers_child_albums() {
     assert_eq!(
         names,
         vec![
-            "clip.mp4",
             "dup.jpg",
             "dup.png",
             "logo.svg",
@@ -337,13 +335,6 @@ async fn sync_indexes_files_and_discovers_child_albums() {
     assert_eq!(photo.height, 0);
     assert_eq!(photo.duration_sec, None);
 
-    assert_eq!(
-        rows.iter()
-            .find(|media| media.name == "clip.mp4")
-            .unwrap()
-            .r#type,
-        MediaType::Video
-    );
     assert_eq!(
         rows.iter()
             .find(|media| media.name == "song.mp3")
@@ -731,6 +722,55 @@ async fn indexing_stores_video_timing_metadata() {
     assert_eq!(item["type"], "video");
     assert_eq!(item["framerate"], 25.0);
     assert_eq!(item["frameCount"], frame_count);
+
+    drop(dir);
+}
+
+#[tokio::test]
+async fn videos_are_skipped_without_ffprobe() {
+    let (dir, state) = setup().await;
+    let root_id = root_album_id(&state).await;
+
+    std::fs::write(state.config.media_dir.join("clip.mp4"), b"not a real video").unwrap();
+
+    let mut state = state;
+    state.capabilities.ffprobe = false;
+
+    set_indexed_at(&state, root_id, None).await;
+    let app = app(state.clone());
+    let since = Utc::now() - chrono::Duration::seconds(1);
+    let (status, _, _) = send(&app, "/api/v1/album/root/index?force").await;
+    assert_eq!(status, StatusCode::OK);
+    wait_for_indexed(&state, root_id, since).await;
+
+    let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM media WHERE name = 'clip.mp4'")
+        .fetch_one(&state.db)
+        .await
+        .unwrap();
+    assert_eq!(count, 0, "a video without probed dimensions is not stored");
+
+    drop(dir);
+}
+
+#[tokio::test]
+async fn videos_without_readable_dimensions_are_not_stored() {
+    let (dir, state) = setup().await;
+    let root_id = root_album_id(&state).await;
+
+    std::fs::write(state.config.media_dir.join("clip.mp4"), b"garbage").unwrap();
+
+    set_indexed_at(&state, root_id, None).await;
+    let app = app(state.clone());
+    let since = Utc::now() - chrono::Duration::seconds(1);
+    let (status, _, _) = send(&app, "/api/v1/album/root/index?force").await;
+    assert_eq!(status, StatusCode::OK);
+    wait_for_indexed(&state, root_id, since).await;
+
+    let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM media WHERE name = 'clip.mp4'")
+        .fetch_one(&state.db)
+        .await
+        .unwrap();
+    assert_eq!(count, 0, "unreadable metadata must not leave a row");
 
     drop(dir);
 }

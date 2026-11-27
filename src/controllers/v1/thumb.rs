@@ -23,7 +23,7 @@ use crate::models::{Media, MediaType};
 use crate::resolvers::{resolve_album, resolve_media};
 use crate::state::AppState;
 
-use super::secure::{media_cache_control, verify_link};
+use super::secure::{media_cache_control, original_redirect, verify_link};
 use super::types::LinkQuery;
 
 /// `GET /thumb/v1/{album_hash}/{media_hash}/{spec}?sign=&exp=`.
@@ -60,6 +60,22 @@ pub async fn get_thumb(
     // Быстрый путь: файл уже есть на диске
     if let Ok(bytes) = tokio::fs::read(&cache_path).await {
         return Ok(webp_response(bytes, exp));
+    }
+
+    // Without libvips no preview can be resized or encoded. Degrade explicitly
+    // instead of failing every request: send the client to the original file,
+    // or serve an already extracted video/animation frame.
+    if !state.capabilities.vips {
+        return degraded_preview(
+            &state,
+            &album_hash,
+            &media_hash,
+            &query,
+            &source,
+            &media,
+            exp,
+        )
+        .await;
     }
 
     // Videos and animations are rendered from a cached frame so the source
@@ -130,6 +146,9 @@ async fn ensure_frame(state: &AppState, source: PathBuf, media: &Media) -> Resul
     if is_file(&frame).await {
         return Ok(frame);
     }
+    if !state.capabilities.ffmpeg {
+        return Err("ffmpeg is unavailable and no frame is cached".to_string());
+    }
 
     let key = format!("frame/{}", media.hash);
     let target = frame.clone();
@@ -157,6 +176,49 @@ async fn ensure_frame(state: &AppState, source: PathBuf, media: &Media) -> Resul
         .map_err(|err| format!("cannot cache a frame: {err}"))?;
 
     Ok(frame)
+}
+
+/// Preview fallback when libvips is missing.
+///
+/// Images and vectors are sent to their original file. Video and animation
+/// previews need a frame, which FFmpeg can still extract without libvips; when
+/// neither a cached frame nor FFmpeg is available the request fails.
+async fn degraded_preview(
+    state: &AppState,
+    album_hash: &str,
+    media_hash: &str,
+    query: &LinkQuery,
+    source: &std::path::Path,
+    media: &Media,
+    exp: i64,
+) -> Result<Response, AppError> {
+    match media.r#type {
+        MediaType::Image | MediaType::Vector => {
+            Ok(original_redirect(album_hash, media_hash, query, exp))
+        }
+        MediaType::Video | MediaType::Animated => {
+            let frame = if state.capabilities.ffmpeg {
+                ensure_frame(state, source.to_path_buf(), media).await.ok()
+            } else {
+                let path = state.frame_path(&media.hash);
+                is_file(&path).await.then_some(path)
+            };
+
+            match frame {
+                Some(path) => {
+                    let bytes = tokio::fs::read(&path).await?;
+                    Ok(png_response(bytes, exp))
+                }
+                None => Err(AppError::Internal(format!(
+                    "libvips is unavailable and `{}` has no exported frame",
+                    media.name
+                ))),
+            }
+        }
+        _ => Err(AppError::BadRequest(
+            "previews are only available for images and videos".into(),
+        )),
+    }
 }
 
 async fn is_file(path: &Path) -> bool {
@@ -188,6 +250,16 @@ fn webp_response(bytes: Vec<u8>, exp: i64) -> Response {
     Response::builder()
         .status(StatusCode::OK)
         .header(header::CONTENT_TYPE, "image/webp")
+        .header(header::CACHE_CONTROL, media_cache_control(exp))
+        .header(header::CONTENT_LENGTH, bytes.len())
+        .body(Body::from(bytes))
+        .expect("static response parts are valid")
+}
+
+fn png_response(bytes: Vec<u8>, exp: i64) -> Response {
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "image/png")
         .header(header::CACHE_CONTROL, media_cache_control(exp))
         .header(header::CONTENT_LENGTH, bytes.len())
         .body(Body::from(bytes))

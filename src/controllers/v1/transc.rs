@@ -23,7 +23,7 @@ use crate::models::MediaType;
 use crate::resolvers::{resolve_album, resolve_media};
 use crate::state::AppState;
 
-use super::secure::{media_cache_control, verify_link};
+use super::secure::{media_cache_control, original_redirect, verify_link};
 use super::types::LinkQuery;
 
 /// `GET /transc/v2/{album_hash}/{media_hash}/{spec}?sign=&exp=`.
@@ -52,6 +52,12 @@ pub async fn get_transcode(
     let source = state.media_path(&album, &media).ok_or(AppError::NotFound)?;
     if !tokio::fs::metadata(&source).await?.is_file() {
         return Err(AppError::NotFound);
+    }
+
+    // Without FFmpeg the server cannot produce an MP4. Redirect to the
+    // original file instead of failing the viewer.
+    if !state.capabilities.ffmpeg {
+        return Ok(original_redirect(&album_hash, &media_hash, &query, exp));
     }
 
     let mut child = spawn_transcode(&state.config.ffmpeg_bin, &source, direction, size)

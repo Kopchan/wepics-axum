@@ -73,6 +73,41 @@ async fn transcodes_stream_a_scaled_h264_clip_without_audio() {
 }
 
 #[tokio::test]
+async fn transcodes_redirect_to_the_original_without_ffmpeg() {
+    let (dir, state) = setup().await;
+    let root_id = root_album_id(&state).await;
+
+    insert_typed_media(
+        &state.db,
+        root_id,
+        "clip.mp4",
+        "vid",
+        MediaType::Video,
+        320,
+        240,
+        None,
+        10,
+    )
+    .await;
+    std::fs::write(state.config.media_dir.join("clip.mp4"), b"mp4").unwrap();
+
+    let mut state = state;
+    state.capabilities.ffmpeg = false;
+
+    let app = app(state.clone());
+    let query = link(&state, "root", "vid");
+    let (status, headers, body) = send(&app, &format!("/transc/v2/root/vid/h144?{query}")).await;
+
+    assert_eq!(status, StatusCode::TEMPORARY_REDIRECT);
+    assert!(body.is_empty());
+    let location = headers[axum::http::header::LOCATION].to_str().unwrap();
+    assert!(location.starts_with("/file/v1/root/vid?sign="));
+    assert!(location.ends_with(&query));
+
+    drop(dir);
+}
+
+#[tokio::test]
 async fn transcodes_require_a_valid_link_and_a_video() {
     let (dir, state) = setup().await;
     let root_id = root_album_id(&state).await;

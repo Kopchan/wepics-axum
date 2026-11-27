@@ -213,6 +213,107 @@ async fn animated_previews_use_a_cached_frame() {
 }
 
 #[tokio::test]
+async fn previews_redirect_to_the_original_without_libvips() {
+    let (dir, state) = setup().await;
+    let root_id = root_album_id(&state).await;
+
+    write_png(&state.config.media_dir.join("photo.png"), 80, 60);
+    insert_media(
+        &state.db,
+        root_id,
+        NewMedia {
+            name: "photo.png",
+            hash: "media1",
+            date: None,
+            size: 10,
+        },
+    )
+    .await;
+
+    let mut state = state;
+    state.capabilities.vips = false;
+
+    let app = app(state.clone());
+    let query = link(&state, "root", "media1");
+    let (status, headers, body) = send(&app, &format!("/thumb/v1/root/media1/w144?{query}")).await;
+
+    assert_eq!(status, StatusCode::TEMPORARY_REDIRECT);
+    assert!(body.is_empty());
+    let location = headers[axum::http::header::LOCATION].to_str().unwrap();
+    assert!(location.starts_with("/file/v1/root/media1?sign="));
+    assert!(location.ends_with(&query));
+
+    drop(dir);
+}
+
+#[tokio::test]
+async fn video_previews_serve_a_cached_frame_without_libvips() {
+    let (dir, state) = setup().await;
+    let root_id = root_album_id(&state).await;
+
+    insert_typed_media(
+        &state.db,
+        root_id,
+        "clip.mp4",
+        "vid",
+        MediaType::Video,
+        80,
+        60,
+        None,
+        10,
+    )
+    .await;
+    std::fs::write(state.config.media_dir.join("clip.mp4"), b"mp4").unwrap();
+
+    // Pretend FFmpeg exported the frame earlier; libvips itself is missing.
+    write_png(&state.frame_path("vid"), 80, 60);
+    let mut state = state;
+    state.capabilities.vips = false;
+    state.capabilities.ffmpeg = false;
+
+    let app = app(state.clone());
+    let query = link(&state, "root", "vid");
+    let (status, headers, body) = send(&app, &format!("/thumb/v1/root/vid/w144?{query}")).await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(headers[axum::http::header::CONTENT_TYPE], "image/png");
+    assert_eq!(&body[..8], b"\x89PNG\r\n\x1a\n");
+
+    drop(dir);
+}
+
+#[tokio::test]
+async fn video_previews_fail_without_libvips_and_a_frame() {
+    let (dir, state) = setup().await;
+    let root_id = root_album_id(&state).await;
+
+    insert_typed_media(
+        &state.db,
+        root_id,
+        "clip.mp4",
+        "vid",
+        MediaType::Video,
+        80,
+        60,
+        None,
+        10,
+    )
+    .await;
+    std::fs::write(state.config.media_dir.join("clip.mp4"), b"mp4").unwrap();
+
+    let mut state = state;
+    state.capabilities.vips = false;
+    state.capabilities.ffmpeg = false;
+
+    let app = app(state.clone());
+    let query = link(&state, "root", "vid");
+    let (status, _, _) = send(&app, &format!("/thumb/v1/root/vid/w144?{query}")).await;
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+
+    drop(dir);
+}
+
+#[tokio::test]
 async fn only_images_and_videos_have_previews() {
     let (dir, state) = setup().await;
     let root_id = root_album_id(&state).await;
