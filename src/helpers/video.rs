@@ -275,7 +275,10 @@ pub fn spawn_transcode(
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        // A client that disconnects early must not leave FFmpeg running.
+        // The child belongs to the background job, not to the HTTP response:
+        // a viewer that disconnects must not stop the encode, because the
+        // finished clip is still cached. If the job task itself is cancelled
+        // (runtime shutdown), the process must not outlive it.
         .kill_on_drop(true)
         .spawn()
         .map_err(|err| format!("cannot run `{}`: {err}", ffmpeg.display()))

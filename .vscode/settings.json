@@ -1,0 +1,14 @@
+{
+  "files.watcherExclude": {
+    "**/target/**": true,
+    "**/.git/objects/**": true,
+    "**/data/**": true,
+    "**/public/**": true,
+  },
+  "rust-analyzer.files.excludeDirs": [
+    ".git",
+    "target",
+    "data",
+    "public",
+  ],
+}

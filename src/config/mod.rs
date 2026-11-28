@@ -193,19 +193,19 @@ impl AppConfig {
 
     /// Root directory used to store previews.
     pub fn thumb_dir(&self) -> PathBuf {
-        thumb_dir(&self.cache_dir)
+        self.cache_dir.join("thumbs").join("v1")
     }
 
     /// Directory holding original-size frames extracted from videos and
     /// animations. Other preview sizes are derived from these files.
     pub fn frames_dir(&self) -> PathBuf {
-        self.cache_dir.join("frames")
+        self.cache_dir.join("frames").join("v1")
     }
-}
 
-/// Root directory for generated previews, from a cache root.
-pub fn thumb_dir(cache_dir: &Path) -> PathBuf {
-    cache_dir.join("thumbs").join("v1")
+    /// Root directory used to store cached video transcodes.
+    pub fn transcode_dir(&self) -> PathBuf {
+        self.cache_dir.join("transc").join("v1")
+    }
 }
 
 fn env_string(name: &str) -> Option<String> {

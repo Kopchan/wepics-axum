@@ -1,9 +1,12 @@
-//! `GET /transc/v2/{album}/{media}/{direction}{size}` — streaming video previews.
+//! `GET /transc/v1/{album}/{media}/{direction}{size}` — streaming video previews.
 //!
 //! FFmpeg encodes the first seconds of a video to a fragmented MP4 and the
 //! response streams the process output as it is produced. The scale, frame
 //! rate and audio rules mirror `/thumb/v1`: a fixed cap on one axis, 30 fps and
 //! no audio.
+//!
+//! Transcodes are shared: every request for the same clip and size attaches to
+//! one background job, and the finished clip is cached for later requests.
 
 use std::pin::Pin;
 use std::task::{Context, Poll};
@@ -12,8 +15,7 @@ use axum::body::{Body, Bytes};
 use axum::extract::{Path, Query, State};
 use axum::http::{StatusCode, header};
 use axum::response::Response;
-use tokio::io::{AsyncRead, AsyncReadExt, ReadBuf};
-use tokio::process::{Child, ChildStderr, ChildStdout};
+use tokio::io::{AsyncRead, ReadBuf};
 use tokio_stream::Stream;
 
 use crate::error::AppError;
@@ -26,7 +28,7 @@ use crate::state::AppState;
 use super::secure::{media_cache_control, original_redirect, verify_link};
 use super::types::LinkQuery;
 
-/// `GET /transc/v2/{album_hash}/{media_hash}/{spec}?sign=&exp=`.
+/// `GET /transc/v1/{album_hash}/{media_hash}/{spec}?sign=&exp=`.
 pub async fn get_transcode(
     State(state): State<AppState>,
     Path((album_hash, media_hash, spec)): Path<(String, String, String)>,
@@ -43,9 +45,9 @@ pub async fn get_transcode(
 
     let album = resolve_album(&state, &album_hash).await?;
     let media = resolve_media(&state, &album, &media_hash).await?;
-    if media.r#type != MediaType::Video {
+    if !matches!(media.r#type, MediaType::Video | MediaType::Animated) {
         return Err(AppError::BadRequest(
-            "transcodes are only available for videos".into(),
+            "transcodes are only available for videos and animations".into(),
         ));
     }
 
@@ -59,48 +61,60 @@ pub async fn get_transcode(
     if !state.capabilities.ffmpeg {
         return Ok(original_redirect(&album_hash, &media_hash, &query, exp));
     }
+    
+    let variant_dir = state
+        .config
+        .transcode_dir()
+        .join(format!("{direction}{size}"));
+    let cached_path = variant_dir.join(format!("{}.mp4", media.hash));
+    let cache_key = format!("{direction}{size}/{}", media.hash);
 
-    let mut child = spawn_transcode(&state.config.ffmpeg_bin, &source, direction, size)
-        .map_err(AppError::Internal)?;
-    let stdout = child
-        .stdout
-        .take()
-        .ok_or_else(|| AppError::Internal("ffmpeg produced no output pipe".into()))?;
-
-    // Keep the pipe drained; FFmpeg would block once the OS buffer fills.
-    if let Some(stderr) = child.stderr.take() {
-        tokio::spawn(log_stderr(stderr, media.hash.clone()));
+    // 1. Если уже закэшировано на диске — отдаём сразу
+    if let Ok(file) = tokio::fs::File::open(&cached_path).await {
+        let usable = file
+            .metadata()
+            .await
+            .map(|metadata| metadata.len() > 0)
+            .unwrap_or(false);
+        if usable {
+            return Response::builder()
+                .status(StatusCode::OK)
+                .header(header::CONTENT_TYPE, "video/mp4")
+                .header(header::CACHE_CONTROL, media_cache_control(exp))
+                .body(Body::from_stream(FileStream { file }))
+                .map_err(|err| AppError::Internal(err.to_string()));
+        }
     }
+
+    // 2. Иначе запускаем/подключаемся к общему процессу в TranscodeHub
+    let ffmpeg_bin = state.config.ffmpeg_bin.clone();
+    let stream = state.transcode_hub().subscribe(
+        cache_key,
+        variant_dir,
+        cached_path,
+        move || spawn_transcode(&ffmpeg_bin, &source, direction, size),
+    );
 
     Response::builder()
         .status(StatusCode::OK)
         .header(header::CONTENT_TYPE, "video/mp4")
         .header(header::CACHE_CONTROL, media_cache_control(exp))
-        .body(Body::from_stream(TranscodeStream {
-            _child: child,
-            stdout,
-        }))
+        .body(Body::from_stream(stream))
         .map_err(|err| AppError::Internal(err.to_string()))
 }
 
-/// Streams FFmpeg stdout as the response body.
-///
-/// The process handle is kept alive here; `kill_on_drop` on the command stops
-/// FFmpeg as soon as the client goes away and this stream is dropped.
-struct TranscodeStream {
-    _child: Child,
-    stdout: ChildStdout,
+struct FileStream {
+    file: tokio::fs::File,
 }
 
-impl Stream for TranscodeStream {
+impl Stream for FileStream {
     type Item = Result<Bytes, std::io::Error>;
 
-    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        let this = self.get_mut();
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         let mut buffer = [0_u8; 64 * 1024];
         let mut read = ReadBuf::new(&mut buffer);
 
-        match Pin::new(&mut this.stdout).poll_read(cx, &mut read) {
+        match Pin::new(&mut self.file).poll_read(cx, &mut read) {
             Poll::Pending => Poll::Pending,
             Poll::Ready(Err(err)) => Poll::Ready(Some(Err(err))),
             Poll::Ready(Ok(())) => {
@@ -112,16 +126,5 @@ impl Stream for TranscodeStream {
                 }
             }
         }
-    }
-}
-
-/// Collects FFmpeg diagnostics and logs them once the process ends. An empty
-/// log means the transcode was clean.
-async fn log_stderr(mut stderr: ChildStderr, media_hash: String) {
-    let mut text = String::new();
-    let _ = stderr.read_to_string(&mut text).await;
-    let text = text.trim();
-    if !text.is_empty() {
-        eprintln!("ERR: transcode {media_hash}: {text}");
     }
 }

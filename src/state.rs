@@ -9,9 +9,8 @@ use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions};
 use crate::config::AppConfig;
 use crate::config::tools::Capabilities;
 use crate::helpers::secure_link;
-use crate::hubs::indexer::IndexHub;
+use crate::hubs::{IndexHub, ThumbHub, TranscodeHub};
 use crate::hubs::sync_tracker::{SyncGuard, SyncTracker};
-use crate::hubs::thumb::ThumbHub;
 use crate::models::{Album, Media, ROOT_ALBUM_HASH};
 
 /// Shared application state, cloned into every handler by axum.
@@ -32,6 +31,8 @@ pub struct AppState {
     index_hub: IndexHub,
     /// Deduplicates concurrent thumbnail generation requests.
     thumb_hub: ThumbHub,
+    /// Deduplicates concurrent transcode generation requests.
+    transcode_hub: TranscodeHub,
 }
 
 impl AppState {
@@ -45,6 +46,7 @@ impl AppState {
             syncing: SyncTracker::default(),
             index_hub: IndexHub::default(),
             thumb_hub: ThumbHub::default(),
+            transcode_hub: TranscodeHub::default(),
         }
     }
 
@@ -98,6 +100,8 @@ impl AppState {
         tokio::fs::create_dir_all(self.thumb_dir()).await?;
         // Original-size frames are shared by every video preview size.
         tokio::fs::create_dir_all(self.config.frames_dir()).await?;
+        // Video-previews in cache for video and animations
+        tokio::fs::create_dir_all(self.config.transcode_dir()).await?;
 
         // `OR IGNORE` makes restarts idempotent.
         sqlx::query("INSERT OR IGNORE INTO albums (name, hash, sort_name) VALUES (?1, ?1, ?2)")
@@ -183,6 +187,17 @@ impl AppState {
     /// Shared thumbnail deduplication hub.
     pub(crate) fn thumb_hub(&self) -> &ThumbHub {
         &self.thumb_hub
+    }
+    /// Shared transcode deduplication hub.
+    pub(crate) fn transcode_hub(&self) -> &TranscodeHub {
+        &self.transcode_hub
+    }
+
+    /// Highest number of FFmpeg preview jobs that ran at the same time.
+    ///
+    /// Exposed so tests and diagnostics can assert the concurrency cap.
+    pub fn peak_transcodes(&self) -> usize {
+        self.transcode_hub.peak_concurrency()
     }
 }
 
